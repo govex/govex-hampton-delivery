@@ -1,0 +1,51 @@
+# ── Generated data ────────────────────────────────────────────────────────────
+# Data/seed/ and Data/overrides/ are committed.
+# Other Data/ subdirs contain generated outputs — contents ignored, .gitkeep committed.
+Data/01_ingest/*
+!Data/01_ingest/.gitkeep
+Data/02_standardize/*
+!Data/02_standardize/.gitkeep
+Data/03_merge/*
+!Data/03_merge/.gitkeep
+Data/04_analyze/*
+!Data/04_analyze/.gitkeep
+
+# ── Generated reports and plots ───────────────────────────────────────────────
+# Contents ignored, .gitkeep committed to preserve dir structure.
+Reports/01_ingest/*
+!Reports/01_ingest/.gitkeep
+Reports/02_standardize/*
+!Reports/02_standardize/.gitkeep
+Reports/03_merge/*
+!Reports/03_merge/.gitkeep
+Reports/04_analyze/*
+!Reports/04_analyze/.gitkeep
+Reports/05_visualize/*
+!Reports/05_visualize/.gitkeep
+Plots/*
+!Plots/.gitkeep
+
+# ── Source data and reference documents ──────────────────────────────────────
+Resources/
+Archive/
+*.xlsx
+*.docx
+*.pdf
+
+# ── Environment and secrets ───────────────────────────────────────────────────
+.env
+
+# ── R artifacts ───────────────────────────────────────────────────────────────
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+
+# ── Quarto artifacts ──────────────────────────────────────────────────────────
+.quarto/
+*_cache/
+*_files/
+
+# ── OS artifacts ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

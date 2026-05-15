@@ -1,0 +1,201 @@
+---
+title: "Hampton Childcare — Manual Overrides"
+date: "`r Sys.Date()`"
+format: gfm
+---
+
+## Overview
+
+Stores phone-confirmed hours corrections and (currently empty) subsidy
+overrides. These records are the authoritative source for any facility where
+hours data from DSS or CCAV was found to be inaccurate through direct
+verification.
+
+Each `name_pattern` is a lowercase substring matched against `name_key` in the
+merged provider table. A pattern may match one facility or several — the merge
+module reports exactly which facilities each pattern matched. Every pattern
+**must** match at least one real facility or the pipeline will stop with an
+error.
+
+**Output:**
+- `Data/merge/manual_overrides_hours.csv`
+- `Data/merge/manual_overrides_subsidy.csv`
+
+| Limitation | Detail |
+|---|---|
+| Kimberly Glover | Voicemail left 2026-03-26; hours unconfirmed. No override rows until confirmation is received. |
+| Sunday "by parent arrangement" | Annie Mae Bembury Sunday hours are indeterminate; `is_open = NA`. This is not treated as open or closed. |
+| Empty subsidy overrides | No phone-confirmed subsidy status corrections exist at this time. |
+
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(readr)
+library(tibble)
+library(dplyr)
+library(stringr)
+library(knitr)
+
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+## Phone-Confirmed Hours Overrides
+
+Each row represents one facility × day combination confirmed by phone call.
+The `confirmed_note` field records the date and substance of each call.
+
+```{r hours-overrides}
+hours_overrides <- tribble(
+  ~name_pattern,             ~day,         ~open_time, ~close_time, ~is_open, ~confirmed_note,
+
+  # annie mae bembury — Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement
+  "annie mae bembury",       "Monday",     "00:00",    "23:59",     TRUE,     "Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement",
+  "annie mae bembury",       "Tuesday",    "00:00",    "23:59",     TRUE,     "Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement",
+  "annie mae bembury",       "Wednesday",  "00:00",    "23:59",     TRUE,     "Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement",
+  "annie mae bembury",       "Thursday",   "00:00",    "23:59",     TRUE,     "Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement",
+  "annie mae bembury",       "Friday",     "00:00",    "23:59",     TRUE,     "Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement",
+  "annie mae bembury",       "Saturday",   "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement",
+  # Sunday: by parent arrangement — status left as NA (not open, not closed)
+  "annie mae bembury",       "Sunday",     NA,         NA,          NA,       "Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement",
+
+  # sylvia bennette — Phone confirmed 2026-03-26: M-F 6:30am-6pm
+  "sylvia bennette",         "Monday",     "06:30",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6:30am-6pm",
+  "sylvia bennette",         "Tuesday",    "06:30",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6:30am-6pm",
+  "sylvia bennette",         "Wednesday",  "06:30",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6:30am-6pm",
+  "sylvia bennette",         "Thursday",   "06:30",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6:30am-6pm",
+  "sylvia bennette",         "Friday",     "06:30",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6:30am-6pm",
+  "sylvia bennette",         "Saturday",   NA,         NA,          FALSE,    "Phone confirmed 2026-03-26: M-F 6:30am-6pm",
+  "sylvia bennette",         "Sunday",     NA,         NA,          FALSE,    "Phone confirmed 2026-03-26: M-F 6:30am-6pm",
+
+  # pure at heart childcare — Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend not currently operating
+  "pure at heart childcare", "Monday",     "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating",
+  "pure at heart childcare", "Tuesday",    "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating",
+  "pure at heart childcare", "Wednesday",  "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating",
+  "pure at heart childcare", "Thursday",   "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating",
+  "pure at heart childcare", "Friday",     "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating",
+  "pure at heart childcare", "Saturday",   NA,         NA,          FALSE,    "Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating",
+  "pure at heart childcare", "Sunday",     NA,         NA,          FALSE,    "Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating",
+
+  # alstons village — Phone confirmed 2026-03-26: M-F 6am-6pm
+  "alstons village",         "Monday",     "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "alstons village",         "Tuesday",    "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "alstons village",         "Wednesday",  "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "alstons village",         "Thursday",   "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "alstons village",         "Friday",     "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "alstons village",         "Saturday",   NA,         NA,          FALSE,    "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "alstons village",         "Sunday",     NA,         NA,          FALSE,    "Phone confirmed 2026-03-26: M-F 6am-6pm",
+
+  # live laugh grow — Phone confirmed 2026-03-26: M-F 6am-6pm
+  "live laugh grow",         "Monday",     "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "live laugh grow",         "Tuesday",    "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "live laugh grow",         "Wednesday",  "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "live laugh grow",         "Thursday",   "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "live laugh grow",         "Friday",     "06:00",    "18:00",     TRUE,     "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "live laugh grow",         "Saturday",   NA,         NA,          FALSE,    "Phone confirmed 2026-03-26: M-F 6am-6pm",
+  "live laugh grow",         "Sunday",     NA,         NA,          FALSE,    "Phone confirmed 2026-03-26: M-F 6am-6pm"
+)
+```
+
+## Subsidy Overrides
+
+Currently empty. Add entries here only when subsidy status has been confirmed
+by phone or there is a documented basis for the assumption.
+
+```{r subsidy-overrides}
+subsidy_overrides <- tribble(
+  ~name_pattern, ~accepts_subsidy, ~subsidy_note
+  # Format: lowercase substring of name_key, TRUE/FALSE, "basis for assumption"
+)
+```
+
+## Write Outputs
+
+```{r validate-and-write}
+# All name_patterns must be lowercase — prevents silent mismatch with name_key
+non_lowercase <- hours_overrides |>
+  distinct(name_pattern) |>
+  filter(name_pattern != str_to_lower(name_pattern))
+
+if (nrow(non_lowercase) > 0) {
+  stop("Override name_pattern(s) must be lowercase:\n",
+       paste(non_lowercase$name_pattern, collapse = "\n"))
+}
+
+hours_path   <- here("Data", "overrides", "manual_overrides_hours.csv")
+subsidy_path <- here("Data", "overrides", "manual_overrides_subsidy.csv")
+
+write_csv(hours_overrides,   hours_path)
+write_csv(subsidy_overrides, subsidy_path)
+
+cat(sprintf("Wrote %d rows → %s\n", nrow(hours_overrides),   basename(hours_path)))
+cat(sprintf("Wrote %d rows → %s\n", nrow(subsidy_overrides), basename(subsidy_path)))
+```
+
+## Main Findings
+
+```{r main-findings}
+kable(
+  hours_overrides |>
+    group_by(name_pattern) |>
+    summarise(
+      days_confirmed = sum(!is.na(is_open) & is_open == TRUE),
+      days_closed    = sum(!is.na(is_open) & is_open == FALSE),
+      days_indeterminate = sum(is.na(is_open)),
+      note           = first(confirmed_note),
+      .groups = "drop"
+    ),
+  caption = "Hours overrides by facility pattern"
+)
+```
+
+## Summary
+
+```{r summary}
+kable(data.frame(
+  Item = c(
+    "Facilities with hours overrides",
+    "Total override rows (hours)",
+    "Subsidy overrides"
+  ),
+  Count = c(
+    n_distinct(hours_overrides$name_pattern),
+    nrow(hours_overrides),
+    nrow(subsidy_overrides)
+  )
+))
+```
+
+## Data Quality Audit
+
+### Override Coverage
+
+```{r audit-coverage}
+# Check that every pattern has a full 7-day set of override rows
+day_coverage <- hours_overrides |>
+  group_by(name_pattern) |>
+  summarise(n_days = n_distinct(day), .groups = "drop")
+
+incomplete <- day_coverage |> filter(n_days < 7)
+if (nrow(incomplete) > 0) {
+  cat("WARNING: The following patterns have fewer than 7 day rows:\n")
+  kable(incomplete)
+} else {
+  cat("All patterns have a full 7-day set of override rows.\n")
+}
+```
+
+## Manual Audit Log
+
+This section is a static, append-only record of verification calls. It does
+not recompute on render.
+
+| Date | Facility pattern | Action taken |
+|---|---|---|
+| 2026-03-26 | annie mae bembury | Phone call: M–F 24hr confirmed; Sat 6am–6pm confirmed; Sun by parent arrangement |
+| 2026-03-26 | sylvia bennette | Phone call: M–F 6:30am–6pm confirmed |
+| 2026-03-26 | pure at heart childcare | Phone call: M–F 6am–6pm confirmed; late-night/weekend services not currently operating |
+| 2026-03-26 | alstons village | Phone call: M–F 6am–6pm confirmed |
+| 2026-03-26 | live laugh grow | Phone call: M–F 6am–6pm confirmed |
+| 2026-03-26 | kimberly glover | Voicemail left; no response received. No override applied pending confirmation. |

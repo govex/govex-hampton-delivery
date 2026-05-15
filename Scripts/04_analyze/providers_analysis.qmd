@@ -1,0 +1,394 @@
+---
+title: "Hampton Childcare — Analysis"
+date: "`r Sys.Date()`"
+format: gfm
+---
+
+## Overview
+
+Applies project-specific filters and computes the headline metrics for the
+Hampton childcare access analysis, in response to findings from the 2024
+Hampton Poverty Study. The analysis focuses on under-5 facilities — those
+whose youngest served age is below 60 months.
+
+Four metrics are computed:
+
+1. **Subsidy acceptance** — share of under-5 facilities accepting the Virginia
+   Child Care Subsidy program
+2. **Infant service** — share of under-5 facilities serving infants (age min < 12 months)
+3. **Nontraditional hours** — share operating between 8 pm and 5 am (or spanning midnight)
+4. **Weekend operation** — share open on Saturday or Sunday
+
+Nontraditional hours and weekend counts are expressed as ranges because CCAV
+and DSS hours data sometimes disagrees. The **low** estimate requires both
+sources to indicate nontraditional/weekend operation; the **high** estimate
+fires if either source does. Phone-confirmed values are treated as fixed.
+
+**Input:**
+- `Data/merge/providers_merged_YYYY-MM-DD.csv`
+- `Data/merge/providers_hours_merged_YYYY-MM-DD.csv`
+- `Data/merge/manual_overrides_hours.csv`
+- `Data/merge/manual_overrides_subsidy.csv`
+
+**Output:** `Data/analysis/providers_analysis_YYYY-MM-DD.csv`
+
+| Limitation | Detail |
+|---|---|
+| CCAV-only facilities have unknown subsidy status | 37% figure is based only on facilities with a DSS record. True share may differ. |
+| Missing hours data | Facilities with no hours in either source are excluded from nontraditional/weekend counts. Best available data. |
+| ECSE / special needs | Derived from CCAV `program_type` free text only. DSS carries no equivalent field. Likely an undercount. |
+| YMCA manual exclusion | age_min = 57 months technically passes the < 60 cutoff but the program is not an early-childhood provider. |
+
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(knitr)
+
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+today <- format(Sys.Date(), "%Y-%m-%d")
+```
+
+## Helper Functions
+
+```{r helpers, include=FALSE}
+locate_latest <- function(dir, pattern) {
+  f <- list.files(dir, pattern = pattern, full.names = TRUE)
+  if (!length(f)) stop("No file matching '", pattern, "' in ", dir)
+  f[which.max(file.mtime(f))]
+}
+
+# Convert HH:MM string to total minutes since midnight
+to_min <- function(t) {
+  t <- str_extract(t, "^[0-9]{2}:[0-9]{2}")
+  if_else(is.na(t), NA_real_,
+    as.numeric(str_sub(t, 1, 2)) * 60 + as.numeric(str_sub(t, 4, 5)))
+}
+
+# A facility day is nontraditional if it closes at or after 8 pm, opens at or
+# before 5 am, or spans midnight (close < open). Threshold chosen to match the
+# 2024 Hampton Poverty Study caregiver survey definition (8 pm–5 am window).
+is_nontrad <- function(open_t, close_t) {
+  op <- to_min(open_t)
+  cl <- to_min(close_t)
+  (!is.na(cl) & cl >= 20 * 60) |
+  (!is.na(op) & op <=  5 * 60) |
+  (!is.na(op) & !is.na(cl) & cl < op)
+}
+
+# Compute nontraditional and weekend flags per facility from the long hours table.
+# Returns one row per name_key with four boolean columns:
+#   nontrad_low  / nontrad_high — conservative / liberal nontraditional estimate
+#   weekend_low  / weekend_high — conservative / liberal weekend estimate
+compute_facility_hours <- function(h) {
+  h |>
+    mutate(
+      # Confirmed rows are treated as authoritative regardless of discrepancy
+      nt_confirmed   = hours_confirmed & coalesce(is_open, FALSE) & is_nontrad(open_time, close_time),
+      # Coalesced rows: unconfirmed, no discrepancy — use merged time
+      nt_coalesced   = !hours_confirmed & !coalesce(time_discrepancy, FALSE) &
+                         coalesce(is_open, FALSE) & is_nontrad(open_time, close_time),
+      nt_ccav        = is_nontrad(open_time_ccav, close_time_ccav) & coalesce(is_open_ccav, FALSE),
+      nt_dss         = is_nontrad(open_time_dss,  close_time_dss)  & coalesce(is_open_dss,  FALSE),
+      # Low: both sources agree it's nontraditional; High: either source says so
+      nt_disc_both   = !hours_confirmed & coalesce(time_discrepancy, FALSE) & nt_ccav & nt_dss,
+      nt_disc_either = !hours_confirmed & coalesce(time_discrepancy, FALSE) & (nt_ccav | nt_dss),
+      is_weekend     = day %in% c("Saturday", "Sunday"),
+      wknd_open_conf = is_weekend & hours_confirmed & coalesce(is_open, FALSE),
+      wknd_open_coal = is_weekend & !hours_confirmed &
+                         !coalesce(time_discrepancy, FALSE) & coalesce(is_open, FALSE),
+      wknd_ccav      = is_weekend & !hours_confirmed & coalesce(is_open_ccav, FALSE),
+      wknd_dss       = is_weekend & !hours_confirmed & coalesce(is_open_dss,  FALSE)
+    ) |>
+    group_by(name_key) |>
+    summarise(
+      nontrad_low  = any(nt_confirmed | nt_coalesced | nt_disc_both,   na.rm = TRUE),
+      nontrad_high = any(nt_confirmed | nt_coalesced | nt_disc_either, na.rm = TRUE),
+      weekend_base = any(wknd_open_conf | wknd_open_coal,             na.rm = TRUE),
+      weekend_ccav = any(wknd_ccav,                                   na.rm = TRUE),
+      weekend_dss  = any(wknd_dss,                                    na.rm = TRUE),
+      .groups = "drop"
+    ) |>
+    mutate(
+      weekend_low  = weekend_base | (weekend_ccav & weekend_dss),
+      weekend_high = weekend_base | weekend_ccav | weekend_dss
+    )
+}
+
+pct     <- function(n, d) sprintf("%.0f%%", 100 * n / d)
+pct_rng <- function(lo, hi, d) sprintf("%.0f%%–%.0f%%", 100 * lo / d, 100 * hi / d)
+```
+
+## Load Data
+
+```{r load-data}
+merged_path       <- locate_latest(here("Data", "03_merge"), "^providers_merged_.*\\.csv$")
+hours_merged_path <- locate_latest(here("Data", "03_merge"), "^providers_hours_merged_.*\\.csv$")
+
+cat(sprintf("Merged:       %s\nHours (long): %s\n",
+  basename(merged_path), basename(hours_merged_path)))
+
+merged       <- read_csv(merged_path,       show_col_types = FALSE)
+hours_merged <- read_csv(hours_merged_path, show_col_types = FALSE)
+
+hours_ov_path     <- here("Data", "overrides", "manual_overrides_hours.csv")
+subsidy_ov_path   <- here("Data", "overrides", "manual_overrides_subsidy.csv")
+hours_overrides   <- if (file.exists(hours_ov_path))   read_csv(hours_ov_path,   show_col_types = FALSE) else tibble()
+subsidy_overrides <- if (file.exists(subsidy_ov_path)) read_csv(subsidy_ov_path, show_col_types = FALSE) else tibble()
+```
+
+## Apply Subsidy Overrides
+
+```{r subsidy-overrides}
+if (nrow(subsidy_overrides) > 0) {
+  bad_sub_ov <- subsidy_overrides |>
+    anti_join(merged |> distinct(name_key), by = "name_key")
+  if (nrow(bad_sub_ov) > 0) {
+    warning("Subsidy override name_key(s) not found in merged: ",
+            paste(bad_sub_ov$name_key, collapse = ", "))
+  }
+  merged <- merged |>
+    left_join(
+      subsidy_overrides |>
+        filter(!is.na(accepts_subsidy)) |>
+        select(name_key, .sub_ov = accepts_subsidy),
+      by = "name_key"
+    ) |>
+    mutate(
+      subsidy_assumed = !is.na(.sub_ov),
+      accepts_subsidy = if_else(subsidy_assumed, .sub_ov, accepts_subsidy)
+    ) |>
+    select(-.sub_ov)
+  cat(sprintf("Applied %d subsidy overrides.\n", sum(merged$subsidy_assumed)))
+} else {
+  merged <- merged |> mutate(subsidy_assumed = FALSE)
+  cat("No subsidy overrides.\n")
+}
+```
+
+## Apply Exclusions
+
+```{r exclusions}
+# The YMCA (young mens christian) has age_min = 57 months — just under the 60
+# month cutoff — but is not an early-childhood childcare provider. Manually
+# excluded to avoid inflating the under-5 count.
+manual_exclude        <- c("young mens christian")
+manual_exclude_reason <- "age_min = 57 months (4yr 9mo); known non-early-childhood program"
+
+n_before   <- nrow(merged)
+analysis   <- merged |>
+  filter(
+    !str_detect(name_key, regex(paste(manual_exclude, collapse = "|"), ignore_case = TRUE)),
+    !is.na(age_min_months),
+    age_min_months < 60
+  )
+
+n_excl_age <- sum(!is.na(merged$age_min_months) & merged$age_min_months >= 60)
+n_excl_na  <- sum(is.na(merged$age_min_months))
+n_excl_man <- sum(str_detect(merged$name_key,
+                   regex(paste(manual_exclude, collapse = "|"), ignore_case = TRUE)))
+na_names   <- merged |> filter(is.na(age_min_months)) |> pull(name) |> paste(collapse = "; ")
+```
+
+## Compute Hours Metrics
+
+```{r compute-hours}
+u5  <- analysis |> filter(serves_under_5 == TRUE)
+u5s <- u5       |> filter(accepts_subsidy == TRUE)
+
+hours_analysis <- hours_merged |> filter(name_key %in% analysis$name_key)
+hours_u5       <- hours_merged |> filter(name_key %in% u5$name_key)
+hours_u5s      <- hours_merged |> filter(name_key %in% u5s$name_key)
+
+fac_hours     <- compute_facility_hours(hours_analysis)
+fac_hours_u5  <- compute_facility_hours(hours_u5)
+fac_hours_u5s <- compute_facility_hours(hours_u5s)
+```
+
+## Write Output
+
+```{r write-output}
+analysis_out <- analysis |>
+  left_join(
+    fac_hours |> select(name_key, nontrad_low, nontrad_high, weekend_low, weekend_high),
+    by = "name_key"
+  )
+
+output_path <- here("Data", "04_analyze", paste0("providers_analysis_", today, ".csv"))
+dir.create(here("Data", "04_analyze"), showWarnings = FALSE, recursive = TRUE)
+write_csv(analysis_out, output_path)
+prune_dated(here("Data", "04_analyze"), "^providers_analysis_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$")
+cat(sprintf("Wrote %d rows → %s\n", nrow(analysis_out), basename(output_path)))
+```
+
+## Main Findings
+
+These are the headline metrics that motivated this analysis. All figures are
+for under-5 facilities only (age_min < 60 months, YMCA excluded).
+
+```{r main-findings}
+n_total   <- nrow(analysis)
+n_u5      <- nrow(u5)
+n_u5s     <- nrow(u5s)
+
+n_u5_subsidy_true    <- sum(u5$accepts_subsidy == TRUE,  na.rm = TRUE)
+n_u5_subsidy_false   <- sum(u5$accepts_subsidy == FALSE, na.rm = TRUE)
+n_u5_subsidy_unknown <- sum(is.na(u5$accepts_subsidy))
+n_u5_infants         <- sum(u5$serves_infants, na.rm = TRUE)
+n_u5s_infants        <- sum(u5s$serves_infants, na.rm = TRUE)
+
+nontrad_low   <- sum(fac_hours$nontrad_low)
+nontrad_high  <- sum(fac_hours$nontrad_high)
+u5_nt_low     <- sum(fac_hours_u5$nontrad_low)
+u5_nt_high    <- sum(fac_hours_u5$nontrad_high)
+u5s_nt_low    <- sum(fac_hours_u5s$nontrad_low)
+u5s_nt_high   <- sum(fac_hours_u5s$nontrad_high)
+u5_wknd_low   <- sum(fac_hours_u5$weekend_low)
+u5_wknd_high  <- sum(fac_hours_u5$weekend_high)
+u5s_wknd_low  <- sum(fac_hours_u5s$weekend_low)
+u5s_wknd_high <- sum(fac_hours_u5s$weekend_high)
+
+n_hours_disc    <- hours_analysis |> filter(time_discrepancy) |> pull(name_key) |> n_distinct()
+n_hours_base    <- n_distinct(hours_analysis$name_key)
+
+kable(data.frame(
+  Metric = c(
+    "Under-5 facilities (analysis universe)",
+    "Accept subsidy",
+    "Subsidy status unknown (CCAV only)",
+    "Serve infants (age_min < 12 months)",
+    "Nontraditional hours (low estimate)",
+    "Nontraditional hours (high estimate)",
+    "Open on weekends (low estimate)",
+    "Open on weekends (high estimate)"
+  ),
+  Count = c(
+    n_u5, n_u5_subsidy_true, n_u5_subsidy_unknown, n_u5_infants,
+    u5_nt_low, u5_nt_high, u5_wknd_low, u5_wknd_high
+  ),
+  Pct_of_under5 = c(
+    "100%",
+    pct(n_u5_subsidy_true,  n_u5),
+    pct(n_u5_subsidy_unknown, n_u5),
+    pct(n_u5_infants, n_u5),
+    pct(u5_nt_low,  n_u5), pct(u5_nt_high,  n_u5),
+    pct(u5_wknd_low, n_u5), pct(u5_wknd_high, n_u5)
+  )
+))
+```
+
+*Nontraditional hours range reflects `r n_hours_disc` facilities with per-day
+CCAV/DSS time discrepancies. Phone-confirmed values are treated as fixed.*
+
+## Summary
+
+### Exclusion Filter
+
+```{r summary-exclusions}
+kable(data.frame(
+  Step = c(
+    "Total from merge",
+    "Excluded: age_min ≥ 60 months",
+    "Excluded: no age data",
+    "Excluded: manual (YMCA)",
+    "Analysis total"
+  ),
+  Removed = c("—", sprintf("-%d", n_excl_age), sprintf("-%d", n_excl_na),
+              sprintf("-%d", n_excl_man), "—"),
+  Remaining = c(n_before, n_before - n_excl_age,
+                n_before - n_excl_age - n_excl_na,
+                n_before - n_excl_age - n_excl_na - n_excl_man,
+                n_total),
+  Note = c("", "School-age only", na_names, manual_exclude_reason, "")
+))
+```
+
+### Under-5 + Subsidy Cross-Tab
+
+```{r summary-u5-subsidy}
+kable(data.frame(
+  Group = c("Under-5", "Under-5 + subsidy"),
+  n = c(n_u5, n_u5s),
+  pct_of_u5 = c("100%", pct(n_u5s, n_u5)),
+  serves_infants = c(
+    sprintf("%d (%s)", n_u5_infants,  pct(n_u5_infants,  n_u5)),
+    sprintf("%d (%s)", n_u5s_infants, pct(n_u5s_infants, n_u5))
+  ),
+  nontrad_low_high = c(
+    sprintf("%d–%d (%s)", u5_nt_low,  u5_nt_high,  pct_rng(u5_nt_low,  u5_nt_high,  n_u5)),
+    sprintf("%d–%d (%s)", u5s_nt_low, u5s_nt_high, pct_rng(u5s_nt_low, u5s_nt_high, n_u5))
+  )
+))
+```
+
+## Data Quality Audit
+
+### Missing Hours Data
+
+```{r audit-missing-hours}
+n_analysis_missing_hours <- hours_analysis |>
+  group_by(name_key) |>
+  summarise(has_hours = any(!is.na(open_time)), .groups = "drop") |>
+  filter(!has_hours) |>
+  nrow()
+
+cat(sprintf(
+  "%d of %d analysis facilities have no hours data in either source.\n",
+  n_analysis_missing_hours, n_u5
+))
+cat("These facilities are excluded from nontraditional and weekend counts.\n")
+```
+
+### Suspicious Flag Checks
+
+```{r audit-flags}
+# Facilities with nontrad_low = TRUE but no confirmed hours — hours from sources only
+source_nontrad <- analysis_out |>
+  filter(nontrad_low == TRUE) |>
+  left_join(hours_analysis |>
+    group_by(name_key) |>
+    summarise(any_confirmed = any(hours_confirmed), .groups = "drop"),
+    by = "name_key"
+  ) |>
+  filter(!coalesce(any_confirmed, FALSE))
+
+if (nrow(source_nontrad) > 0) {
+  cat(sprintf(
+    "%d facilities flagged nontraditional (low) based on unconfirmed source hours:\n",
+    nrow(source_nontrad)
+  ))
+  kable(source_nontrad |> select(name, nontrad_low, nontrad_high, accepts_subsidy))
+}
+```
+
+### Zero / Missing Value Summary
+
+```{r audit-zeros}
+kable(data.frame(
+  Field = c("address", "phone", "hours (any)", "subsidy status"),
+  NA_or_missing = c(
+    sum(is.na(analysis_out$address)),
+    sum(is.na(analysis_out$phone) | analysis_out$phone == "", na.rm = TRUE),
+    n_analysis_missing_hours,
+    sum(is.na(analysis_out$accepts_subsidy))
+  )
+))
+```
+
+### Random Spot Check
+
+```{r audit-spot-check}
+set.seed(as.integer(Sys.Date()))
+kable(
+  slice_sample(analysis_out, n = min(5, nrow(analysis_out))) |>
+    select(name, source, age_min_months, serves_infants,
+           accepts_subsidy, nontrad_low, nontrad_high),
+  caption = "Random date-seeded spot check"
+)
+```

@@ -1,0 +1,261 @@
+---
+title: "Hampton Childcare — CCAV Standardize"
+date: "`r Sys.Date()`"
+format: gfm
+---
+
+## Overview
+
+Cleans and normalizes the CCAV ingest data to produce merge-ready fields. The
+two key transformations are age range parsing (free-text string → numeric
+months) and hours parsing (day-and-time string → structured `days`,
+`open_time`, `close_time` fields). A name key and address key are also
+generated for the downstream join with DSS.
+
+**Input:** `Data/ingest/CCAV_ingest_YYYY-MM-DD.csv`
+**Output:** `Data/standardize/CCAV_standardize_YYYY-MM-DD.csv`
+
+| Step | Input format | Output |
+|---|---|---|
+| Address cleaning | `"N Director Name 123 Real St"` | Street-only address |
+| Age range parsing | `"1 Year 4 Months - 12 Years 11 Months"` | `age_min_months`, `age_max_months` |
+| Hours parsing | `"Monday - Friday 6:00am - 8:00pm"` | `days`, `open_time`, `close_time` (24h HH:MM) |
+| Name key | Honorifics stripped, lowercased, punctuation removed | `name_key` |
+| Address key | Uppercased, `"City VA XXXXX"` → `"City, VA XXXXX"` | `address_key` |
+
+| Limitation | Detail |
+|---|---|
+| Age data absent for some facilities | Parsed values will be NA; those facilities are excluded in the analysis stage. |
+| Hours format variation | CCAV hours strings vary; unrecognized formats produce NA open/close times. |
+| Address prefix contamination | Some addresses begin with a director name; the director field is used to strip it. |
+
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(knitr)
+
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+today <- format(Sys.Date(), "%Y-%m-%d")
+```
+
+## Helper Functions
+
+```{r helpers, include=FALSE}
+# Parse a single age bound string (e.g. "1 Year 4 Months") to total months.
+# Extracts the first year and month value found; coerces missing to 0.
+parse_age_to_months <- function(x) {
+  x <- str_to_lower(str_squish(x))
+  years  <- coalesce(as.numeric(str_extract(x, "(\\d+)(?=\\s*year)")),  0)
+  months <- coalesce(as.numeric(str_extract(x, "(\\d+)(?=\\s*month)")), 0)
+  years * 12 + months
+}
+
+parse_age_range <- function(age_str) {
+  parts <- str_split(age_str, "\\s*-\\s*", n = 2)[[1]]
+  if (length(parts) < 2) {
+    return(list(age_min_months = NA_real_, age_max_months = NA_real_))
+  }
+  list(
+    age_min_months = parse_age_to_months(parts[1]),
+    age_max_months = parse_age_to_months(parts[2])
+  )
+}
+
+# Parse CCAV hours string to days range, open time, close time (24h HH:MM).
+# CCAV format: "Monday - Friday 6:00am - 8:00pm"
+parse_ccav_hours <- function(h) {
+  h <- str_squish(h)
+
+  # Day portion is everything before the first digit; time portion is from first digit
+  day_part  <- str_extract(h, "^[^\\d]+(?=\\d)") |> str_squish()
+  time_part <- str_extract(h, "\\d.*$")           |> str_squish()
+
+  day_range <- str_replace_all(day_part, "\\s*-\\s*", "-") |>
+    str_remove("-$") |>
+    str_squish()
+
+  times <- str_extract_all(time_part, "\\d{1,2}:\\d{2}", simplify = FALSE)[[1]]
+  ampm  <- str_extract_all(time_part, "(?<=\\d{2})(am|pm)", simplify = FALSE)[[1]]
+
+  to_24h <- function(t, ap) {
+    if (is.na(t) || t == "") return(NA_character_)
+    parts <- str_split(t, ":")[[1]]
+    h <- as.integer(parts[1])
+    m <- as.integer(parts[2])
+    if (!is.na(ap)) {
+      ap <- str_to_lower(ap)
+      if (ap == "pm" && h != 12) h <- h + 12
+      if (ap == "am" && h == 12) h <- 0L
+    }
+    sprintf("%02d:%02d", h, m)
+  }
+
+  open_time  <- if (length(times) >= 1) to_24h(times[1], ampm[1]) else NA_character_
+  close_time <- if (length(times) >= 2) to_24h(times[2], ampm[2]) else NA_character_
+
+  list(days = day_range, open_time = open_time, close_time = close_time)
+}
+
+# Lowercase, strip honorifics, remove punctuation — used as join key with DSS
+standardise_name <- function(x) {
+  x |>
+    str_remove_all("^(Ms\\.|Mrs\\.|Mr\\.|Dr\\.)\\s*") |>
+    str_to_lower() |>
+    str_replace_all("[^a-z0-9 ]", "") |>
+    str_squish()
+}
+
+# Uppercase, normalize spacing, insert missing comma before "VA XXXXX"
+standardise_address <- function(x) {
+  x |>
+    str_replace("(?<=[a-zA-Z])\\s+(VA\\s+\\d{5})", ", \\1") |>
+    str_squish() |>
+    str_to_upper()
+}
+
+# Strip the director name prefix from the address field.
+# CCAV scraper sometimes captures "N Director Name 123 Real St"; use the
+# director column to find and remove that prefix. Takes the LAST match to
+# handle doubled entries from the scraper.
+strip_director_prefix <- function(address, director) {
+  if (is.na(address) || is.na(director) || director == "") return(address)
+  locs <- str_locate_all(address, fixed(director, ignore_case = TRUE))[[1]]
+  if (nrow(locs) == 0) return(address)
+  str_squish(str_sub(address, max(locs[, "end"]) + 1))
+}
+```
+
+## Load Data
+
+```{r load-data}
+ingest_files <- list.files(
+  here("Data", "01_ingest"),
+  pattern    = "^CCAV_ingest_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$",
+  full.names = TRUE
+)
+if (length(ingest_files) == 0) stop("No CCAV ingest file found in Data/ingest/")
+ingest_path <- ingest_files[which.max(file.mtime(ingest_files))]
+cat(sprintf("Reading: %s (%d rows)\n", basename(ingest_path), nrow(read_csv(ingest_path, show_col_types = FALSE, n_max = 0))))
+raw <- read_csv(ingest_path, show_col_types = FALSE)
+```
+
+## Apply Transformations
+
+```{r transform}
+processed <- raw |>
+  mutate(
+    address        = map2_chr(address, director, strip_director_prefix),
+    age_parsed     = map(ages, parse_age_range),
+    age_min_months = map_dbl(age_parsed, "age_min_months"),
+    age_max_months = map_dbl(age_parsed, "age_max_months"),
+    serves_under_5 = age_min_months < 60,
+    hours_parsed   = map(hours, parse_ccav_hours),
+    days           = map_chr(hours_parsed, "days"),
+    open_time      = map_chr(hours_parsed, "open_time"),
+    close_time     = map_chr(hours_parsed, "close_time"),
+    name_key       = standardise_name(name),
+    address_key    = standardise_address(address),
+    source         = "CCAV"
+  ) |>
+  select(-age_parsed, -hours_parsed)
+```
+
+## Write Output
+
+```{r write-output}
+output_path <- here("Data", "02_standardize", paste0("CCAV_standardize_", today, ".csv"))
+dir.create(here("Data", "02_standardize"), showWarnings = FALSE, recursive = TRUE)
+write_csv(processed, output_path)
+prune_dated(here("Data", "02_standardize"), "^CCAV_standardize_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$")
+cat(sprintf("Wrote %d rows → %s\n", nrow(processed), basename(output_path)))
+```
+
+## Main Findings
+
+```{r main-findings}
+kable(data.frame(
+  Metric = c(
+    "Input rows", "Output rows",
+    "Serves under-5 (age_min < 60 months)",
+    "Serves infants (age_min < 12 months)",
+    "Missing age data",
+    "Missing open_time"
+  ),
+  Count = c(
+    nrow(raw), nrow(processed),
+    sum(processed$serves_under_5, na.rm = TRUE),
+    sum(processed$age_min_months < 12, na.rm = TRUE),
+    sum(is.na(processed$age_min_months)),
+    sum(is.na(processed$open_time))
+  )
+))
+```
+
+## Summary
+
+```{r summary-days}
+kable(
+  processed |> count(days, sort = TRUE),
+  caption = "Days distribution (top values)"
+)
+```
+
+## Data Quality Audit
+
+### Age Range Distribution
+
+```{r audit-age}
+cat("age_min_months:\n")
+print(summary(processed$age_min_months))
+cat("\nage_max_months:\n")
+print(summary(processed$age_max_months))
+```
+
+### Hours Parsing Failures
+
+```{r audit-hours}
+# Facilities with hours text but no parsed open_time indicate a format not
+# handled by parse_ccav_hours — review the raw hours strings below
+unparsed <- processed |>
+  filter(!is.na(hours), hours != "", is.na(open_time))
+
+if (nrow(unparsed) > 0) {
+  cat(sprintf("WARNING: %d facilities have hours text but no parsed open_time:\n", nrow(unparsed)))
+  kable(unparsed |> select(name, hours, days, open_time, close_time))
+} else {
+  cat("All facilities with hours text were successfully parsed.\n")
+}
+```
+
+### Missing Fields
+
+```{r audit-missing}
+kable(data.frame(
+  Field     = c("address_key", "age_min_months", "open_time", "close_time", "name_key"),
+  NA_count  = c(
+    sum(is.na(processed$address_key)),
+    sum(is.na(processed$age_min_months)),
+    sum(is.na(processed$open_time)),
+    sum(is.na(processed$close_time)),
+    sum(is.na(processed$name_key))
+  )
+))
+```
+
+### Random Spot Check
+
+```{r audit-spot-check}
+set.seed(as.integer(Sys.Date()))
+kable(
+  slice_sample(processed, n = min(5, nrow(processed))) |>
+    select(name, age_min_months, age_max_months, days, open_time, close_time, name_key),
+  caption = "Random date-seeded spot check"
+)
+```

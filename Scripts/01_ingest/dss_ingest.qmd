@@ -1,0 +1,310 @@
+---
+title: "Hampton Childcare — DSS Ingest"
+date: "`r Sys.Date()`"
+format: gfm
+---
+
+## Overview
+
+Collects all childcare facility records for the City of Hampton (FIPS 650) from
+the Virginia Department of Social Services (DSS) facility search at
+`https://www.dss.virginia.gov/facility/search/cc2.cgi`. This is a server-side
+CGI form — no browser or CAPTCHA required. The DSS list is the authoritative
+source for licensure status and subsidy provider designation in Virginia.
+
+**Fields collected:** name, address, phone, facility_type, license_type,
+license_id, expiration_date, administrator, hours, capacity, ages, subsidy
+provider status, inspector.
+
+**Output:** `Data/ingest/DSS_ingest_YYYY-MM-DD.csv`
+
+| Limitation | Detail |
+|---|---|
+| SSL verification disabled | Virginia's state server uses a cert chain not trusted by R's default CA bundle. Disabled for this URL only — see note in setup. |
+| ~30-second runtime | One GET per facility with a 0.5 s polite delay. |
+| Subsidy filter omitted | `search_modifiers_mod_cde=1` intentionally excluded — returns all facilities, not just current subsidy providers. |
+| Unlicensed tab | Included; entries may be transitional or out-of-date. |
+
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(httr)
+library(rvest)
+library(dplyr)
+library(stringr)
+library(readr)
+library(knitr)
+
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+DSS_BASE     <- "https://www.dss.virginia.gov/facility/search/cc2.cgi"
+HAMPTON_FIPS <- "650"
+today        <- format(Sys.Date(), "%Y-%m-%d")
+out_file     <- here("Data", "01_ingest", paste0("DSS_ingest_", today, ".csv"))
+
+# Virginia's state server uses a cert chain not in R's default CA bundle.
+# SSL verification is disabled for this known government URL only.
+# Do not copy this pattern for other URLs.
+ssl_no_verify <- config(ssl_verifypeer = 0L, ssl_verifyhost = 0L)
+
+# If a DSS ingest file already exists (e.g. copied from seed), skip scraping
+# and report from the existing file. The most recent file is used.
+existing_dss <- tail(sort(Sys.glob(here("Data", "01_ingest", "DSS_ingest_*.csv"))), 1)
+use_existing <- length(existing_dss) > 0
+if (use_existing) {
+  message("Existing DSS ingest file found — skipping scrape: ", basename(existing_dss))
+  results <- read_csv(existing_dss, show_col_types = FALSE)
+}
+```
+
+## Helper Functions
+
+```{r helpers, include=FALSE}
+# Parse facility links from one result tab (Licensed or Unlicensed)
+parse_tab <- function(html, tab_id) {
+  tab_div <- html |> html_element(paste0("#", tab_id))
+  if (is.na(tab_div)) return(tibble())
+  links <- tab_div |> html_elements("a[href*='rm=Details']")
+  tibble(
+    name = html_text(links, trim = TRUE),
+    href = html_attr(links, "href"),
+    tab  = tab_id
+  ) |> filter(nchar(name) > 0)
+}
+
+# Parse a single facility detail page into a one-row tibble.
+# The detail data sits in a two-column <table class="cc_search">; each <tr>
+# has a label cell and a value cell. Address and phone live in a float:left
+# header block where name and street merge after str_squish — street is
+# extracted from the first digit onward.
+parse_detail <- function(facility_id, name, tab, detail_url) {
+  resp <- tryCatch(
+    with_config(ssl_no_verify, GET(detail_url)),
+    error = function(e) { message("  ERROR fetching ", name, ": ", e$message); NULL }
+  )
+  if (is.null(resp) || http_error(resp)) {
+    message("  SKIP (HTTP error): ", name)
+    return(tibble(facility_id = facility_id, name = name, tab = tab, parse_error = TRUE))
+  }
+
+  pg <- read_html(content(resp, as = "raw"), encoding = "latin1")
+
+  detail_table <- pg |>
+    html_elements("table.cc_search") |>
+    (\(tables) {
+      keep <- sapply(tables, \(t) str_detect(html_text(t), "Facility Type"))
+      if (!any(keep)) return(tables[[1]])
+      tables[[which(keep)[1]]]
+    })()
+
+  rows <- detail_table |> html_elements("tr")
+  kv <- Filter(Negate(is.null), lapply(rows, function(row) {
+    cells <- row |> html_elements("td")
+    if (length(cells) < 2) return(NULL)
+    list(
+      label = str_squish(html_text(cells[[1]])),
+      value = str_squish(html_text(cells[[2]]))
+    )
+  }))
+
+  get_val <- function(pattern) {
+    matches <- sapply(kv, \(x) str_detect(x$label, regex(pattern, ignore_case = TRUE)))
+    if (!any(matches)) return(NA_character_)
+    kv[[which(matches)[1]]]$value
+  }
+
+  header_trs <- pg |>
+    html_elements("table[border='0'] tr td[colspan='2']") |>
+    html_text(trim = TRUE) |>
+    str_squish()
+
+  street_raw <- header_trs[str_detect(header_trs, "\\d")][1]
+  street     <- str_extract(street_raw, "\\d{2,}\\s+[A-Za-z].*")
+  city_zip   <- header_trs[str_detect(header_trs, "VA\\s+\\d{5}")][1]
+  address <- if_else(
+    !is.na(street) & !is.na(city_zip),
+    str_squish(paste(street, city_zip, sep = ", ")),
+    NA_character_
+  )
+  phone <- header_trs[str_detect(header_trs, "\\(\\d{3}\\)")][1] |>
+    str_extract("\\(\\d{3}\\)\\s*\\d{3}-\\d{4}")
+
+  tibble(
+    facility_id,
+    name, tab, address, phone,
+    facility_type    = get_val("Facility Type"),
+    license_type     = get_val("License Type"),
+    license_id       = get_val("License/Facility ID"),
+    expiration_date  = get_val("Expiration Date"),
+    administrator    = get_val("Administrator"),
+    hours            = get_val("Business Hours"),
+    capacity         = as.integer(str_extract(get_val("Capacity"), "\\d+")),
+    ages_raw         = get_val("Ages"),
+    subsidy_provider = get_val("Current Subsidy Provider"),
+    inspector        = get_val("Inspector"),
+    parse_error      = FALSE
+  )
+}
+```
+
+## Fetch Facility List
+
+POST the search form to retrieve all Hampton facilities across the Licensed and
+Unlicensed tabs.
+
+```{r fetch-list}
+if (!use_existing) {
+search_response <- with_config(ssl_no_verify, {
+  POST(
+    DSS_BASE,
+    body   = list(
+      rm                   = "Search",
+      search_keywords_name = "",
+      search_exact_fips    = HAMPTON_FIPS
+    ),
+    encode = "form"
+  )
+})
+if (http_error(search_response)) {
+  stop("Search POST failed: HTTP ", status_code(search_response))
+}
+
+search_html <- read_html(content(search_response, as = "raw"), encoding = "latin1")
+
+facility_list <- bind_rows(
+  parse_tab(search_html, "Licensed"),
+  parse_tab(search_html, "Unlicensed")
+) |>
+  mutate(
+    facility_id = str_match(href, "ID=(\\d+)")[, 2],
+    detail_url  = paste0("https://www.dss.virginia.gov", href)
+  ) |>
+  filter(!is.na(facility_id))
+
+cat(sprintf(
+  "Found %d facilities: %d licensed, %d unlicensed\n",
+  nrow(facility_list),
+  sum(facility_list$tab == "Licensed"),
+  sum(facility_list$tab == "Unlicensed")
+))
+} # end !use_existing
+```
+
+## Fetch Detail Pages
+
+One GET request per facility with a 0.5 s delay to avoid overloading the state server.
+
+```{r fetch-details}
+if (!use_existing) {
+all_records <- vector("list", nrow(facility_list))
+for (i in seq_len(nrow(facility_list))) {
+  row <- facility_list[i, ]
+  message(sprintf("  [%d/%d] %s", i, nrow(facility_list), row$name))
+  all_records[[i]] <- parse_detail(row$facility_id, row$name, row$tab, row$detail_url)
+  Sys.sleep(0.5)
+}
+results <- bind_rows(all_records)
+} # end !use_existing
+```
+
+## Write Output
+
+```{r write-output}
+if (!use_existing) {
+  dir.create(here("Data", "01_ingest"), showWarnings = FALSE, recursive = TRUE)
+  write_csv(results, out_file)
+  prune_dated(here("Data", "01_ingest"), "^DSS_ingest_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$")
+  cat(sprintf("Wrote %d rows → %s\n", nrow(results), basename(out_file)))
+} else {
+  cat(sprintf("Reporting from existing file: %s (%d rows)\n", basename(existing_dss), nrow(results)))
+}
+```
+
+## Main Findings
+
+```{r main-findings}
+n_errors  <- sum(results$parse_error, na.rm = TRUE)
+n_subsidy <- sum(str_to_lower(results$subsidy_provider) == "yes", na.rm = TRUE)
+
+kable(data.frame(
+  Metric = c(
+    "Total facilities", "Licensed", "Unlicensed",
+    "Current subsidy providers", "Parse errors"
+  ),
+  Count = c(
+    nrow(results),
+    sum(results$tab == "Licensed"),
+    sum(results$tab == "Unlicensed"),
+    n_subsidy,
+    n_errors
+  )
+))
+```
+
+## Summary
+
+```{r summary-table}
+kable(
+  results |>
+    count(tab, subsidy_provider) |>
+    arrange(tab, subsidy_provider),
+  caption = "Facilities by tab and subsidy status"
+)
+```
+
+## Data Quality Audit
+
+### Parse Errors
+
+```{r audit-parse-errors}
+if (n_errors > 0) {
+  cat(sprintf("WARNING: %d facilities had parse errors:\n", n_errors))
+  for (nm in results$name[results$parse_error == TRUE]) cat(" -", nm, "\n")
+} else {
+  cat("No parse errors.\n")
+}
+```
+
+### Missing Fields
+
+```{r audit-missing}
+kable(data.frame(
+  Field = c("address", "phone", "hours", "capacity", "ages_raw", "subsidy_provider"),
+  NA_count = c(
+    sum(is.na(results$address)),
+    sum(is.na(results$phone)),
+    sum(is.na(results$hours)),
+    sum(is.na(results$capacity)),
+    sum(is.na(results$ages_raw)),
+    sum(is.na(results$subsidy_provider))
+  )
+))
+```
+
+### Suspicious Entries
+
+```{r audit-flags}
+# Flag facilities where the address does not start with a digit —
+# may indicate a name-prefix contamination similar to CCAV
+suspicious <- results |>
+  filter(!is.na(address), !str_detect(address, "^\\d"))
+if (nrow(suspicious) > 0) {
+  cat(sprintf("WARNING: %d facilities with non-numeric address start:\n", nrow(suspicious)))
+  kable(suspicious |> select(name, address))
+} else {
+  cat("No suspicious address entries.\n")
+}
+```
+
+### Random Spot Check
+
+```{r audit-spot-check}
+set.seed(as.integer(Sys.Date()))
+kable(
+  slice_sample(results, n = min(5, nrow(results))) |>
+    select(name, tab, address, hours, ages_raw, subsidy_provider),
+  caption = "Random date-seeded spot check"
+)
+```

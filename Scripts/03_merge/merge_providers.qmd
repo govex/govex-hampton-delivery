@@ -1,0 +1,454 @@
+---
+title: "Hampton Childcare — Merge Providers"
+date: "`r Sys.Date()`"
+format: gfm
+---
+
+## Overview
+
+Joins CCAV and DSS standardized data into a single master provider table using
+a full outer join on `name_key`. No facility from either source is dropped.
+A companion long-format hours table (one row per facility × day) is also
+produced, with phone-confirmed overrides applied and per-day CCAV/DSS
+discrepancies flagged.
+
+**Source preference:** CCAV is preferred for name and program type; DSS is
+preferred for address, licensure, and subsidy data.
+
+**Input:**
+- `Data/standardize/CCAV_standardize_YYYY-MM-DD.csv`
+- `Data/standardize/DSS_standardize_YYYY-MM-DD.csv`
+- `Data/standardize/hours_long_YYYY-MM-DD.csv`
+- `Data/merge/manual_overrides_hours.csv`
+
+**Output:**
+- `Data/merge/providers_merged_YYYY-MM-DD.csv` — one row per facility
+- `Data/merge/providers_hours_merged_YYYY-MM-DD.csv` — one row per facility × day
+
+| Limitation | Detail |
+|---|---|
+| Join key is name_key only | Address is NOT a join key due to NAs and format drift between sources. |
+| CCAV-only facilities have no subsidy data | `accepts_subsidy = NA` for any facility not in DSS. |
+| Source coverage differences unexplained | The two sources have different maintainers and refresh cycles; coverage differences are treated as observed, not interpreted. |
+| Duplicate name_keys produce many-to-many rows | Pipeline warns and continues; review the output if counts look wrong. |
+
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(tidyr)
+library(knitr)
+
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+today <- format(Sys.Date(), "%Y-%m-%d")
+```
+
+## Helper Functions
+
+```{r helpers, include=FALSE}
+locate_latest <- function(dir, pattern) {
+  f <- list.files(dir, pattern = pattern, full.names = TRUE)
+  if (!length(f)) stop("No file matching '", pattern, "' in ", dir)
+  f[which.max(file.mtime(f))]
+}
+
+# Returns TRUE when two values differ (treating NA vs NA as no difference,
+# NA vs non-NA as a difference)
+field_differs <- function(a, b) {
+  if (is.na(a) && is.na(b)) return(FALSE)
+  if (is.na(a) || is.na(b)) return(TRUE)
+  as.character(a) != as.character(b)
+}
+
+std_phone <- function(x) str_remove_all(x, "[^0-9]")
+std_time  <- function(x) str_extract(x, "^[0-9]{2}:[0-9]{2}")
+```
+
+## Load Data
+
+```{r load-data}
+ccav_path       <- locate_latest(here("Data", "02_standardize"), "^CCAV_standardize_.*\\.csv$")
+dss_path        <- locate_latest(here("Data", "02_standardize"), "^DSS_standardize_.*\\.csv$")
+hours_long_path <- locate_latest(here("Data", "02_standardize"), "^hours_long_.*\\.csv$")
+overrides_path  <- here("Data", "overrides", "manual_overrides_hours.csv")
+
+cat(sprintf("CCAV:       %s\nDSS:        %s\nHours long: %s\n",
+  basename(ccav_path), basename(dss_path), basename(hours_long_path)))
+
+ccav           <- read_csv(ccav_path,       show_col_types = FALSE)
+dss            <- read_csv(dss_path,        show_col_types = FALSE)
+hours_long_raw <- read_csv(hours_long_path, show_col_types = FALSE)
+overrides      <- read_csv(overrides_path,  show_col_types = FALSE)
+
+out_date <- str_extract(basename(hours_long_path), "[0-9]{4}-[0-9]{2}-[0-9]{2}")
+if (is.na(out_date)) out_date <- today
+```
+
+## Prepare for Merge
+
+Rename columns with source suffixes before the join so fields from each source
+remain distinguishable in the merged table.
+
+```{r slim-sources}
+ccav_slim <- ccav |>
+  select(
+    name_key,
+    address_key_ccav    = address_key,
+    name_ccav           = name,
+    address_ccav        = address,
+    phone_ccav          = phone,
+    capacity_ccav       = capacity,
+    program_type        = type,
+    license_type_ccav   = licenseType,
+    license_id_ccav     = licenseId,
+    director,
+    age_min_months_ccav = age_min_months,
+    age_max_months_ccav = age_max_months,
+    serves_under_5_ccav = serves_under_5,
+    days_ccav           = days,
+    open_time_ccav      = open_time,
+    close_time_ccav     = close_time,
+    ages_raw_ccav       = ages
+  )
+
+dss_slim <- dss |>
+  select(
+    name_key,
+    address_key_dss    = address_key,
+    name_dss           = name,
+    address_dss        = address,
+    phone_dss          = phone,
+    capacity_dss       = capacity,
+    facility_type      = facility_type,
+    license_type_dss   = license_type,
+    license_id_dss     = license_id,
+    expiration_date,
+    administrator,
+    inspector,
+    subsidy_provider,
+    dss_tab            = tab,
+    age_min_months_dss = age_min_months,
+    age_max_months_dss = age_max_months,
+    serves_under_5_dss = serves_under_5,
+    days_dss           = days,
+    open_time_dss      = open_time,
+    close_time_dss     = close_time,
+    ages_raw_dss       = ages_raw
+  )
+```
+
+## Full Outer Join
+
+```{r join}
+# Warn on duplicate name_keys — these produce many-to-many rows and inflate counts
+dupe_ccav <- ccav_slim |> group_by(name_key) |> filter(n() > 1) |> pull(name_key) |> unique()
+dupe_dss  <- dss_slim  |> group_by(name_key) |> filter(n() > 1) |> pull(name_key) |> unique()
+if (length(dupe_ccav) > 0) warning("Duplicate name_key in CCAV: ", paste(dupe_ccav, collapse = ", "))
+if (length(dupe_dss)  > 0) warning("Duplicate name_key in DSS: ",  paste(dupe_dss,  collapse = ", "))
+
+merged_raw <- full_join(ccav_slim, dss_slim, by = "name_key", relationship = "many-to-many") |>
+  mutate(
+    in_ccav = !is.na(name_ccav),
+    in_dss  = !is.na(name_dss),
+    source  = case_when(
+      in_ccav & in_dss ~ "Both",
+      in_ccav          ~ "CCAV only",
+      TRUE             ~ "DSS only"
+    )
+  )
+```
+
+## Coalesce and Derive Fields
+
+```{r coalesce}
+merged <- merged_raw |>
+  mutate(
+    # CCAV preferred for display name and program type; DSS for everything else
+    name           = coalesce(name_ccav, name_dss),
+    address        = coalesce(address_dss, address_ccav),
+    phone          = coalesce(phone_dss,   phone_ccav),
+    capacity       = coalesce(capacity_dss, capacity_ccav),
+    age_min_months = coalesce(age_min_months_dss, age_min_months_ccav),
+    age_max_months = coalesce(age_max_months_dss, age_max_months_ccav),
+    serves_under_5 = coalesce(serves_under_5_dss, serves_under_5_ccav),
+    ages_raw       = coalesce(ages_raw_dss, ages_raw_ccav),
+    address_key    = coalesce(address_key_ccav, address_key_dss)
+  )
+```
+
+## Discrepancy Flags
+
+Flag fields that differ between sources for facilities present in both. These
+are not errors — they reflect different refresh cycles and maintainers.
+
+```{r discrepancy-flags}
+merged <- merged |>
+  mutate(
+    .disc_address  = map2_lgl(address_key_ccav,          address_key_dss,         field_differs),
+    .disc_phone    = map2_lgl(std_phone(phone_ccav),     std_phone(phone_dss),    field_differs),
+    .disc_capacity = map2_lgl(capacity_ccav,             capacity_dss,            field_differs),
+    .disc_age_min  = map2_lgl(age_min_months_ccav,       age_min_months_dss,      field_differs),
+    .disc_age_max  = map2_lgl(age_max_months_ccav,       age_max_months_dss,      field_differs),
+    .disc_days     = map2_lgl(days_ccav,                 days_dss,                field_differs),
+    .disc_open     = map2_lgl(std_time(open_time_ccav),  std_time(open_time_dss), field_differs),
+    .disc_close    = map2_lgl(std_time(close_time_ccav), std_time(close_time_dss),field_differs)
+  ) |>
+  mutate(
+    discrepant_fields = if_else(
+      source == "Both",
+      pmap_chr(
+        list(.disc_address, .disc_phone, .disc_capacity,
+             .disc_age_min, .disc_age_max, .disc_days, .disc_open, .disc_close),
+        function(addr, ph, cap, amin, amax, dy, op, cl) {
+          labels <- c("address", "phone", "capacity",
+                      "age_min", "age_max", "days", "open_time", "close_time")
+          diffs  <- labels[c(addr, ph, cap, amin, amax, dy, op, cl)]
+          if (length(diffs) == 0) NA_character_ else paste(diffs, collapse = "; ")
+        }
+      ),
+      NA_character_
+    ),
+    has_discrepancy = !is.na(discrepant_fields)
+  ) |>
+  select(-starts_with(".disc_"), -address_key_ccav, -address_key_dss)
+```
+
+## Derived Indicators and Subsidy Status
+
+```{r derive-indicators}
+merged <- merged |>
+  mutate(
+    serves_infants = !is.na(age_min_months) & age_min_months < 12,
+    special_needs  = str_detect(program_type, regex("ECSE|special needs", ignore_case = TRUE)),
+    # CCAV-only facilities have no DSS record → subsidy status is NA
+    # No assumptions are made about subsidy status for CCAV-only facilities
+    accepts_subsidy = case_when(
+      str_to_lower(subsidy_provider) == "yes" ~ TRUE,
+      str_to_lower(subsidy_provider) == "no"  ~ FALSE,
+      TRUE                                    ~ NA
+    )
+  )
+```
+
+## Write Wide Facilities Output
+
+```{r write-wide}
+output_path <- here("Data", "03_merge", paste0("providers_merged_", today, ".csv"))
+write_csv(merged, output_path)
+prune_dated(here("Data", "03_merge"), "^providers_merged_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$")
+cat(sprintf("Wrote %d rows → %s\n", nrow(merged), basename(output_path)))
+```
+
+## Build Long Hours Table
+
+```{r build-hours-long}
+DAY_ORDER     <- c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+all_name_keys <- merged$name_key
+
+hours_ccav <- hours_long_raw |>
+  filter(source == "CCAV") |>
+  select(name_key, day, open_time_ccav = open_time, close_time_ccav = close_time, is_open_ccav = is_open)
+
+hours_dss <- hours_long_raw |>
+  filter(source == "DSS") |>
+  select(name_key, day, open_time_dss = open_time, close_time_dss = close_time, is_open_dss = is_open)
+
+hours_merged <- tibble(
+  name_key = rep(all_name_keys, each = 7),
+  day      = rep(DAY_ORDER, times = length(all_name_keys))
+) |>
+  left_join(hours_ccav, by = c("name_key", "day")) |>
+  left_join(hours_dss,  by = c("name_key", "day")) |>
+  mutate(
+    open_time       = coalesce(open_time_dss,  open_time_ccav),
+    close_time      = coalesce(close_time_dss, close_time_ccav),
+    is_open         = coalesce(is_open_dss,    is_open_ccav),
+    hours_confirmed = FALSE
+  )
+```
+
+## Apply Manual Hours Overrides
+
+Each name_pattern is matched by substring to all name_keys. The pipeline stops
+if any pattern matches no facility — this prevents silent override failures.
+
+```{r apply-overrides}
+all_keys <- hours_merged |> distinct(name_key)
+
+pattern_to_keys <- overrides |>
+  distinct(name_pattern) |>
+  cross_join(all_keys) |>
+  filter(str_detect(name_key, fixed(name_pattern)))
+
+unmatched_patterns <- overrides |>
+  distinct(name_pattern) |>
+  anti_join(pattern_to_keys, by = "name_pattern")
+
+if (nrow(unmatched_patterns) > 0) {
+  stop("Override pattern(s) matched no facilities:\n",
+       paste(unmatched_patterns$name_pattern, collapse = "\n"))
+}
+
+overrides_expanded <- overrides |>
+  left_join(pattern_to_keys, by = "name_pattern", relationship = "many-to-many") |>
+  select(name_key, day, open_time, close_time, is_open)
+
+hours_merged <- hours_merged |>
+  left_join(
+    overrides_expanded |>
+      mutate(.has_ov = TRUE) |>
+      rename(.open = open_time, .close = close_time, .is_open = is_open),
+    by = c("name_key", "day")
+  ) |>
+  mutate(
+    open_time       = if_else(coalesce(.has_ov, FALSE), .open,    open_time),
+    close_time      = if_else(coalesce(.has_ov, FALSE), .close,   close_time),
+    is_open         = if_else(coalesce(.has_ov, FALSE), .is_open, is_open),
+    hours_confirmed = hours_confirmed | coalesce(.has_ov, FALSE)
+  ) |>
+  select(-.open, -.close, -.is_open, -.has_ov)
+```
+
+## Per-Day Discrepancy Flag
+
+```{r hours-discrepancy}
+hours_merged <- hours_merged |>
+  mutate(
+    time_discrepancy = case_when(
+      is.na(open_time_ccav)  | is.na(open_time_dss)  ~ FALSE,
+      is.na(close_time_ccav) | is.na(close_time_dss) ~ FALSE,
+      open_time_ccav  != open_time_dss               ~ TRUE,
+      close_time_ccav != close_time_dss              ~ TRUE,
+      TRUE                                           ~ FALSE
+    )
+  ) |>
+  select(name_key, day,
+         open_time_ccav, close_time_ccav, is_open_ccav,
+         open_time_dss,  close_time_dss,  is_open_dss,
+         open_time, close_time, is_open,
+         hours_confirmed, time_discrepancy)
+```
+
+## Write Long Hours Output
+
+```{r write-hours}
+hours_output_path <- here("Data", "03_merge", paste0("providers_hours_merged_", out_date, ".csv"))
+write_csv(hours_merged, hours_output_path)
+prune_dated(here("Data", "03_merge"), "^providers_hours_merged_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$")
+cat(sprintf("Wrote %d rows → %s\n", nrow(hours_merged), basename(hours_output_path)))
+cat(sprintf("  Confirmed overrides applied: %d\n", sum(hours_merged$hours_confirmed)))
+cat(sprintf("  Per-day time discrepancies:  %d\n", sum(hours_merged$time_discrepancy)))
+```
+
+## Main Findings
+
+```{r main-findings}
+n_total     <- nrow(merged)
+n_both      <- sum(merged$source == "Both")
+n_ccav_only <- sum(merged$source == "CCAV only")
+n_dss_only  <- sum(merged$source == "DSS only")
+
+kable(data.frame(
+  Metric = c(
+    "Total facilities", "Matched in both sources",
+    "CCAV only (no DSS record)", "DSS only (no CCAV record)",
+    "Subsidy status known", "Subsidy status NA (CCAV only)",
+    "Confirmed override rows applied", "Per-day time discrepancies"
+  ),
+  Count = c(
+    n_total, n_both, n_ccav_only, n_dss_only,
+    sum(!is.na(merged$accepts_subsidy)),
+    sum(is.na(merged$accepts_subsidy)),
+    sum(hours_merged$hours_confirmed),
+    sum(hours_merged$time_discrepancy)
+  )
+))
+```
+
+## Summary
+
+```{r summary-discrepancies}
+disc_freq <- merged$discrepant_fields[!is.na(merged$discrepant_fields)] |>
+  str_split("; ") |> unlist() |> table() |> sort(decreasing = TRUE)
+
+cat(sprintf(
+  "%d of %d matched facilities have at least one differing field.\n\n",
+  sum(merged$has_discrepancy, na.rm = TRUE), n_both
+))
+
+kable(
+  data.frame(Field = names(disc_freq), Discrepant_facilities = as.integer(disc_freq)),
+  caption = "Fields with source discrepancies (facilities in both sources only)"
+)
+```
+
+```{r summary-overrides}
+kable(
+  pattern_to_keys |>
+    group_by(name_pattern) |>
+    summarise(matched_keys = paste(sort(name_key), collapse = "; "), n = n(), .groups = "drop"),
+  caption = "Override patterns and matched facilities"
+)
+```
+
+## Data Quality Audit
+
+### CCAV-only Facilities
+
+```{r audit-ccav-only}
+ccav_only_rows <- merged |>
+  filter(source == "CCAV only") |>
+  select(name, program_type, serves_under_5) |>
+  arrange(name)
+
+cat(sprintf("%d facilities appear in CCAV only (no DSS record — subsidy status unknown):\n\n",
+  nrow(ccav_only_rows)))
+kable(ccav_only_rows)
+```
+
+### DSS-only Facilities
+
+```{r audit-dss-only}
+dss_only_rows <- merged |>
+  filter(source == "DSS only") |>
+  select(name, dss_tab, serves_under_5) |>
+  arrange(name)
+
+cat(sprintf("%d facilities appear in DSS only (no CCAV record):\n\n", nrow(dss_only_rows)))
+kable(dss_only_rows)
+```
+
+### Missing Data
+
+```{r audit-missing}
+kable(data.frame(
+  Field    = c("address", "age range", "subsidy status"),
+  NA_count = c(
+    sum(is.na(merged$address)),
+    sum(is.na(merged$age_min_months)),
+    sum(is.na(merged$subsidy_provider))
+  ),
+  Note = c(
+    sprintf("%d CCAV, %d DSS", sum(is.na(merged$address_ccav)), sum(is.na(merged$address_dss))),
+    "no age data in source",
+    "CCAV-only; no DSS record"
+  )
+))
+```
+
+### Random Spot Check
+
+```{r audit-spot-check}
+set.seed(as.integer(Sys.Date()))
+kable(
+  slice_sample(merged, n = min(5, nrow(merged))) |>
+    select(name, source, age_min_months, serves_under_5, accepts_subsidy, has_discrepancy),
+  caption = "Random date-seeded spot check"
+)
+```

@@ -1,0 +1,168 @@
+---
+title: "Hampton Childcare — CCAV Ingest Report"
+date: "`r Sys.Date()`"
+format: gfm
+---
+
+## Overview
+
+Reads the most recent CCAV ingest CSV from `Data/ingest/` and produces a
+quality report. The CSV is downloaded manually using the browser console script
+`Scripts/01_ingest/ccav_ingest.js` — a reCAPTCHA on the CCAV site prevents
+full automation.
+
+**Source:** ChildCare Aware of Virginia (CCAV) search tool at
+`https://stage.worklifesystems.com/parent/25`, filtered to Hampton providers.
+
+**Input:** `Data/ingest/CCAV_ingest_YYYY-MM-DD.csv`
+
+| Limitation | Detail |
+|---|---|
+| Manual collection required | reCAPTCHA blocks automation; script must be run in Chrome DevTools. |
+| No subsidy data | CCAV does not report subsidy acceptance. That field comes entirely from DSS. |
+| Address prefix contamination | Scraper sometimes captures a director name before the street address. Cleaned in `02_standardize/ccav_standardize.qmd`. |
+| Type field concatenated | Raw `type` field joins program type with offer tags. Cleaned in standardize. |
+
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(readr)
+library(dplyr)
+library(stringr)
+library(knitr)
+
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+## Load Data
+
+```{r load-data}
+ingest_files <- list.files(
+  here("Data", "01_ingest"),
+  pattern    = "^CCAV_ingest_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$",
+  full.names = TRUE
+)
+if (length(ingest_files) == 0) {
+  stop(
+    "No CCAV ingest file found in Data/ingest/. ",
+    "Run ccav_ingest.js in Chrome DevTools and move the downloaded CSV to Data/ingest/ before rendering this report."
+  )
+}
+
+# Use the most recently modified file if multiple exist
+ingest_path <- ingest_files[which.max(file.mtime(ingest_files))]
+ingest_date <- str_extract(basename(ingest_path), "[0-9]{4}-[0-9]{2}-[0-9]{2}")
+cat(sprintf("Reading: %s\n", basename(ingest_path)))
+
+raw <- read_csv(ingest_path, show_col_types = FALSE)
+
+# Prune old CCAV ingest CSVs — keep two most recent
+prune_dated(here("Data", "01_ingest"), "^CCAV_ingest_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$")
+```
+
+## Main Findings
+
+```{r main-findings}
+n_total      <- nrow(raw)
+n_licensed   <- sum(
+  str_detect(raw$licenseType, regex("licensed", ignore_case = TRUE)) &
+  !str_detect(raw$licenseType, regex("unlicensed", ignore_case = TRUE)),
+  na.rm = TRUE
+)
+n_unlicensed <- sum(
+  str_detect(raw$licenseType, regex("unlicensed|exempt|registered", ignore_case = TRUE)),
+  na.rm = TRUE
+)
+n_missing_address <- sum(is.na(raw$address) | raw$address == "")
+n_missing_hours   <- sum(is.na(raw$hours)   | raw$hours   == "")
+n_missing_ages    <- sum(is.na(raw$ages)    | raw$ages    == "")
+
+# Addresses not starting with a digit indicate a director-name prefix
+n_address_prefix <- sum(
+  !is.na(raw$address) & raw$address != "" & !str_detect(raw$address, "^\\d"),
+  na.rm = TRUE
+)
+
+kable(data.frame(
+  Metric = c(
+    "Total facilities", "Licensed", "Unlicensed / exempt",
+    "Missing address", "Missing hours", "Missing ages"
+  ),
+  Count = c(n_total, n_licensed, n_unlicensed,
+            n_missing_address, n_missing_hours, n_missing_ages)
+))
+```
+
+## Facility Types
+
+The raw `type` field concatenates program type with offer tags (e.g., `"Child
+Care Center Program Type Offers: Faith Based"`). Values are reported as-is
+from the scraper; cleaning happens in the standardize stage.
+
+```{r facility-types}
+kable(
+  raw |> count(type, sort = TRUE),
+  caption = "Facility types as reported by CCAV (raw)"
+)
+```
+
+## Summary
+
+```{r summary}
+kable(data.frame(
+  Item = c(
+    "Source file",
+    "Ingest date",
+    "Total facilities",
+    "Columns"
+  ),
+  Value = c(
+    basename(ingest_path),
+    ingest_date,
+    as.character(n_total),
+    paste(names(raw), collapse = ", ")
+  )
+))
+```
+
+## Data Quality Audit
+
+### Known Issues
+
+```{r audit-known-issues}
+cat(sprintf(
+  "Address prefix contamination: %d facilities have an address that does not start with a digit.\n",
+  n_address_prefix
+))
+cat("These are cleaned in ccav_standardize.qmd by stripping the director name prefix.\n\n")
+cat("Subsidy data absent — CCAV does not report subsidy acceptance. Sourced entirely from DSS.\n")
+```
+
+### Missing Fields Summary
+
+```{r audit-missing}
+missing_df <- raw |>
+  summarise(across(everything(), \(x) sum(is.na(x) | as.character(x) == ""))) |>
+  tidyr::pivot_longer(everything(), names_to = "field", values_to = "n_missing") |>
+  filter(n_missing > 0) |>
+  arrange(desc(n_missing))
+
+if (nrow(missing_df) == 0) {
+  cat("No missing values detected.\n")
+} else {
+  kable(missing_df, caption = "Fields with missing or blank values")
+}
+```
+
+### Random Spot Check
+
+```{r audit-spot-check}
+set.seed(as.integer(Sys.Date()))
+kable(
+  slice_sample(raw, n = min(5, nrow(raw))) |>
+    select(name, licenseType, address, hours, ages),
+  caption = "Random date-seeded spot check"
+)
+```

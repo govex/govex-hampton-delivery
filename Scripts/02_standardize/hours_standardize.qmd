@@ -1,0 +1,235 @@
+---
+title: "Hampton Childcare — Hours Standardize"
+date: "`r Sys.Date()`"
+format: gfm
+---
+
+## Overview
+
+Expands per-facility hours data from both standardized sources into long
+format: one row per facility × day × source. This structure allows downstream
+modules to compare CCAV and DSS hours side by side and to apply per-day manual
+overrides precisely.
+
+A days string like `"Monday-Friday"` is expanded to 7 rows, with `is_open =
+TRUE` for Monday through Friday and `is_open = FALSE` for Saturday and Sunday.
+Facilities with `NA` days get `is_open = NA` for all seven rows.
+
+**Input:**
+- `Data/standardize/CCAV_standardize_YYYY-MM-DD.csv`
+- `Data/standardize/DSS_standardize_YYYY-MM-DD.csv`
+
+**Output:** `Data/standardize/hours_long_YYYY-MM-DD.csv`
+
+| Limitation | Detail |
+|---|---|
+| Facilities with NA days | Expanded with `is_open = NA` for all days — not the same as known-closed. |
+| Single-day strings | Handled (e.g., `"Saturday"`). Multi-day non-range strings are not (e.g., `"Monday, Wednesday"`). |
+| Open/close times copied only to open days | Days with `is_open = FALSE` get NA times regardless of source. |
+
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(readr)
+library(dplyr)
+library(purrr)
+library(stringr)
+library(knitr)
+
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+DAY_ORDER <- c("Monday", "Tuesday", "Wednesday", "Thursday",
+               "Friday", "Saturday", "Sunday")
+```
+
+## Helper Functions
+
+```{r helpers, include=FALSE}
+locate_latest <- function(dir, pattern) {
+  f <- list.files(dir, pattern = pattern, full.names = TRUE)
+  if (!length(f)) stop("No file matching '", pattern, "' in ", dir)
+  f[which.max(file.mtime(f))]
+}
+
+# Parse a days string to a 7-element logical vector aligned to DAY_ORDER.
+# Handles "Monday-Friday" range and single-day "Saturday" forms.
+# Unrecognized strings produce rep(NA, 7) with a warning.
+parse_days <- function(days_raw) {
+  if (is.na(days_raw)) return(rep(NA, 7))
+
+  cleaned    <- str_trim(str_remove(days_raw, "[^a-zA-Z]+$"))
+  range_ends <- str_match(cleaned, "^(\\w+)-(\\w+)$")
+
+  if (!is.na(range_ends[1, 1])) {
+    start_idx <- match(range_ends[1, 2], DAY_ORDER)
+    end_idx   <- match(range_ends[1, 3], DAY_ORDER)
+    if (is.na(start_idx) || is.na(end_idx)) {
+      warning("Unrecognised day in range: '", days_raw, "' — treating as NA")
+      return(rep(NA, 7))
+    }
+    return(seq_along(DAY_ORDER) >= start_idx & seq_along(DAY_ORDER) <= end_idx)
+  }
+
+  single_idx <- match(cleaned, DAY_ORDER)
+  if (!is.na(single_idx)) {
+    result              <- rep(FALSE, 7)
+    result[single_idx]  <- TRUE
+    return(result)
+  }
+
+  warning("Unrecognised days value: '", days_raw, "' — treating as NA")
+  rep(NA, 7)
+}
+
+# Expand one facility row to 7 rows (one per day)
+expand_to_long <- function(name_key, name, source, days_raw, open_time, close_time) {
+  is_open_vec <- parse_days(days_raw)
+  tibble(
+    name_key   = name_key,
+    name       = name,
+    source     = source,
+    day        = DAY_ORDER,
+    is_open    = is_open_vec,
+    open_time  = if_else(is_open_vec %in% TRUE, as.character(open_time),  NA_character_),
+    close_time = if_else(is_open_vec %in% TRUE, as.character(close_time), NA_character_),
+    days_raw   = days_raw
+  )
+}
+```
+
+## Load Data
+
+```{r load-data}
+ccav_path <- locate_latest(here("Data", "02_standardize"), "^CCAV_standardize_.*\\.csv$")
+dss_path  <- locate_latest(here("Data", "02_standardize"), "^DSS_standardize_.*\\.csv$")
+
+ccav_date <- str_extract(basename(ccav_path), "[0-9]{4}-[0-9]{2}-[0-9]{2}")
+if (is.na(ccav_date)) ccav_date <- format(Sys.Date(), "%Y-%m-%d")
+
+cat(sprintf("CCAV: %s\nDSS:  %s\n", basename(ccav_path), basename(dss_path)))
+
+ccav <- read_csv(ccav_path, show_col_types = FALSE)
+dss  <- read_csv(dss_path,  show_col_types = FALSE)
+```
+
+## Expand to Long Format
+
+```{r expand-ccav}
+ccav_long <- map_dfr(seq_len(nrow(ccav)), function(i) {
+  expand_to_long(
+    name_key   = ccav$name_key[i],
+    name       = ccav$name[i],
+    source     = "CCAV",
+    days_raw   = ccav$days[i],
+    open_time  = ccav$open_time[i],
+    close_time = ccav$close_time[i]
+  )
+})
+```
+
+```{r expand-dss}
+dss_long <- map_dfr(seq_len(nrow(dss)), function(i) {
+  expand_to_long(
+    name_key   = dss$name_key[i],
+    name       = dss$name[i],
+    source     = "DSS",
+    days_raw   = dss$days[i],
+    open_time  = dss$open_time[i],
+    close_time = dss$close_time[i]
+  )
+})
+```
+
+```{r bind}
+hours_long <- bind_rows(ccav_long, dss_long) |>
+  mutate(day = factor(day, levels = DAY_ORDER, ordered = TRUE)) |>
+  arrange(source, name_key, day) |>
+  mutate(day = as.character(day))  # back to character for CSV portability
+```
+
+## Write Output
+
+```{r write-output}
+output_path <- here("Data", "02_standardize", paste0("hours_long_", ccav_date, ".csv"))
+write_csv(hours_long, output_path)
+prune_dated(here("Data", "02_standardize"), "^hours_long_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$")
+cat(sprintf("Wrote %d rows → %s\n", nrow(hours_long), basename(output_path)))
+```
+
+## Main Findings
+
+```{r main-findings}
+n_ccav_fac <- n_distinct(ccav_long$name_key)
+n_dss_fac  <- n_distinct(dss_long$name_key)
+
+kable(data.frame(
+  Source = c("CCAV", "DSS", "Combined"),
+  Facilities = c(n_ccav_fac, n_dss_fac, n_distinct(hours_long$name_key)),
+  Rows = c(nrow(ccav_long), nrow(dss_long), nrow(hours_long))
+))
+```
+
+## Summary
+
+```{r summary-open}
+kable(
+  hours_long |>
+    group_by(source, is_open) |>
+    summarise(n = n(), .groups = "drop"),
+  caption = "is_open distribution by source"
+)
+```
+
+## Data Quality Audit
+
+### Unrecognized Day Strings
+
+```{r audit-days}
+# Facilities where days_raw was present but is_open could not be determined
+# for any day indicate a format not handled by parse_days
+unrecognized <- hours_long |>
+  filter(!is.na(days_raw), days_raw != "") |>
+  group_by(name_key, source, days_raw) |>
+  summarise(all_na = all(is.na(is_open)), .groups = "drop") |>
+  filter(all_na)
+
+if (nrow(unrecognized) > 0) {
+  cat(sprintf("WARNING: %d facility × source combinations with unrecognized day strings:\n",
+              nrow(unrecognized)))
+  kable(unrecognized)
+} else {
+  cat("All day strings were recognized.\n")
+}
+```
+
+### Missing Hours by Day
+
+```{r audit-missing-hours}
+kable(
+  hours_long |>
+    filter(coalesce(is_open, FALSE)) |>
+    group_by(day) |>
+    summarise(
+      n_open        = n(),
+      missing_open  = sum(is.na(open_time)),
+      missing_close = sum(is.na(close_time)),
+      .groups = "drop"
+    ),
+  caption = "Open days with missing open/close times"
+)
+```
+
+### Random Spot Check
+
+```{r audit-spot-check}
+set.seed(as.integer(Sys.Date()))
+kable(
+  hours_long |>
+    filter(coalesce(is_open, FALSE)) |>
+    slice_sample(n = min(10, sum(coalesce(hours_long$is_open, FALSE)))) |>
+    select(name_key, source, day, is_open, open_time, close_time),
+  caption = "Random date-seeded spot check (open days only)"
+)
+```

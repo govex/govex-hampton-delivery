@@ -1,0 +1,36 @@
+name_pattern,day,open_time,close_time,is_open,confirmed_note
+annie mae bembury,Monday,00:00,23:59,TRUE,Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement
+annie mae bembury,Tuesday,00:00,23:59,TRUE,Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement
+annie mae bembury,Wednesday,00:00,23:59,TRUE,Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement
+annie mae bembury,Thursday,00:00,23:59,TRUE,Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement
+annie mae bembury,Friday,00:00,23:59,TRUE,Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement
+annie mae bembury,Saturday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement
+annie mae bembury,Sunday,NA,NA,NA,Phone confirmed 2026-03-26: M-F 24hr; Sat 6am-6pm; Sun by parent arrangement
+sylvia bennette,Monday,06:30,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6:30am-6pm
+sylvia bennette,Tuesday,06:30,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6:30am-6pm
+sylvia bennette,Wednesday,06:30,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6:30am-6pm
+sylvia bennette,Thursday,06:30,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6:30am-6pm
+sylvia bennette,Friday,06:30,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6:30am-6pm
+sylvia bennette,Saturday,NA,NA,FALSE,Phone confirmed 2026-03-26: M-F 6:30am-6pm
+sylvia bennette,Sunday,NA,NA,FALSE,Phone confirmed 2026-03-26: M-F 6:30am-6pm
+pure at heart childcare,Monday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating
+pure at heart childcare,Tuesday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating
+pure at heart childcare,Wednesday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating
+pure at heart childcare,Thursday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating
+pure at heart childcare,Friday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating
+pure at heart childcare,Saturday,NA,NA,FALSE,Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating
+pure at heart childcare,Sunday,NA,NA,FALSE,Phone confirmed 2026-03-26: M-F 6am-6pm; late night/weekend services not currently operating
+alstons village,Monday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm
+alstons village,Tuesday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm
+alstons village,Wednesday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm
+alstons village,Thursday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm
+alstons village,Friday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm
+alstons village,Saturday,NA,NA,FALSE,Phone confirmed 2026-03-26: M-F 6am-6pm
+alstons village,Sunday,NA,NA,FALSE,Phone confirmed 2026-03-26: M-F 6am-6pm
+live laugh grow,Monday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm
+live laugh grow,Tuesday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm
+live laugh grow,Wednesday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm
+live laugh grow,Thursday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm
+live laugh grow,Friday,06:00,18:00,TRUE,Phone confirmed 2026-03-26: M-F 6am-6pm
+live laugh grow,Saturday,NA,NA,FALSE,Phone confirmed 2026-03-26: M-F 6am-6pm
+live laugh grow,Sunday,NA,NA,FALSE,Phone confirmed 2026-03-26: M-F 6am-6pm

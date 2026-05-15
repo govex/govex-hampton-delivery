@@ -1,0 +1,345 @@
+---
+title: "Hampton Childcare — Visualizations"
+date: "`r Sys.Date()`"
+format: gfm
+# To render HTML instead:
+#   quarto render Scripts/05_visualize/visualizations.qmd --to html --output-dir Reports/05_visualize
+---
+
+## Overview
+
+Produces five donut charts summarizing the headline metrics from the Hampton
+childcare access analysis. These charts are the primary deliverable to the
+City of Hampton's BHCLI Data Track mayoral team.
+
+All charts use the under-5 analysis dataset as the universe (facilities whose
+youngest served age is below 60 months, YMCA excluded). Counts and percentages
+are derived directly from the analysis output CSV — no additional calculations
+are performed here.
+
+| Chart | File |
+|---|---|
+| Subsidy acceptance (all under-5) | `Plots/subsidy_donut.png` |
+| Infant service (all under-5) | `Plots/infants_donut.png` |
+| Infant service by subsidy status | `Plots/infants_subsidy_donut.png` |
+| Nontraditional hours (all under-5) | `Plots/nontrad_donut.png` |
+| Nontraditional hours by subsidy status | `Plots/nontrad_subsidy_donut.png` |
+
+Nontraditional hours charts show a range (solid + hatched arc) because CCAV
+and DSS hours data sometimes disagrees. The solid arc reflects the conservative
+(low) estimate; the hatched extension reflects the range to the liberal (high)
+estimate.
+
+| Limitation | Detail |
+|---|---|
+| Unknown subsidy status | CCAV-only facilities are counted in the denominator but have no confirmed subsidy status. |
+| Hours range | Nontraditional hours are a range, not a single figure, due to source discrepancies. |
+
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(tidyverse)
+library(ggforce)
+library(ggpattern)
+library(readr)
+
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+knitr::opts_knit$set(root.dir = here::here())
+
+# Load the most recent analysis output
+analysis_file <- tail(sort(Sys.glob(here::here("Data", "04_analyze", "providers_analysis_*.csv"))), 1)
+if (length(analysis_file) == 0) stop("No analysis output found in Data/analysis/")
+analysis <- read_csv(analysis_file, show_col_types = FALSE)
+u5 <- analysis
+
+plots_dir <- here::here("Plots")
+dir.create(plots_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Color palette — viridis-adjacent, consistent across all charts
+clr_yes <- "#8856A7"  # dark purple
+clr_no  <- "#9EBCDA"  # medium blue
+clr_unk <- "#E0ECF4"  # light blue
+
+# Derived counts used across charts
+sub_data <- u5 |>
+  mutate(status = case_when(
+    accepts_subsidy == TRUE  ~ "Accepts subsidy",
+    accepts_subsidy == FALSE ~ "Does not accept subsidy",
+    TRUE                     ~ "Unknown"
+  )) |>
+  count(status)
+
+inf_data <- u5 |>
+  mutate(status = if_else(serves_infants, "Serves infants", "Does not serve\ninfants")) |>
+  count(status)
+
+inf_sub_split <- u5 |>
+  mutate(status = case_when(
+    serves_infants & accepts_subsidy == TRUE  ~ "Serves infants\n& accepts subsidy",
+    serves_infants & accepts_subsidy == FALSE ~ "Serves infants,\ndoes not accept subsidy",
+    TRUE                                      ~ "Does not serve\ninfants"
+  )) |>
+  count(status)
+
+# Nontraditional hours — pre-computed low/high in analysis CSV
+nt_low      <- sum(u5$nontrad_low,                               na.rm = TRUE)
+nt_high     <- sum(u5$nontrad_high,                              na.rm = TRUE)
+nt_sub_low  <- sum(u5$nontrad_low  & u5$accepts_subsidy == TRUE, na.rm = TRUE)
+nt_sub_high <- sum(u5$nontrad_high & u5$accepts_subsidy == TRUE, na.rm = TRUE)
+n_total     <- nrow(u5)
+```
+
+## Helper Functions
+
+```{r donut-fn, include=FALSE}
+# Standard donut: one slice per category with leader lines and percent labels
+donut_chart <- function(df, status_col, n_col, colors, title) {
+  total <- sum(df[[n_col]])
+  df2 <- df |>
+    mutate(
+      prop        = .data[[n_col]] / total,
+      end_angle   = 2 * pi * cumsum(prop),
+      start_angle = lag(end_angle, default = 0),
+      mid_angle   = (start_angle + end_angle) / 2,
+      lx          = sin(mid_angle) * 1.45,
+      ly          = cos(mid_angle) * 1.45,
+      sx0         = sin(mid_angle) * 1.03,
+      sy0         = cos(mid_angle) * 1.03,
+      sx1         = sin(mid_angle) * 1.30,
+      sy1         = cos(mid_angle) * 1.30,
+      hjust       = if_else(sin(mid_angle) >= 0, 0, 1),
+      label_text  = paste0(.data[[status_col]], "\n", round(100 * prop), "%")
+    )
+
+  ggplot(df2) +
+    geom_arc_bar(
+      aes(x0 = 0, y0 = 0, r0 = 0, r = 1,
+          start = start_angle, end = end_angle,
+          fill = .data[[status_col]]),
+      color = "white", linewidth = 0.8
+    ) +
+    geom_segment(
+      aes(x = sx0, y = sy0, xend = sx1, yend = sy1),
+      color = "grey55", linewidth = 0.4
+    ) +
+    geom_text(
+      aes(x = lx, y = ly, label = label_text, hjust = hjust),
+      size = 5.6, lineheight = 1.0, color = "grey20"
+    ) +
+    scale_fill_manual(values = colors, guide = "none") +
+    coord_equal(clip = "off") +
+    xlim(-1.7, 1.7) + ylim(-1.5, 1.5) +
+    labs(title = title) +
+    theme_void() +
+    theme(
+      plot.title  = element_text(hjust = 0.5, size = 15, face = "bold",
+                                 margin = margin(b = 12)),
+      plot.margin = margin(20, 40, 20, 40)
+    )
+}
+
+# Build polygon data for the hatched uncertainty band on range donuts
+arc_polygon <- function(start, end, r = 1, n = 200) {
+  theta <- seq(start, end, length.out = n)
+  rbind(data.frame(x = 0, y = 0),
+        data.frame(x = sin(theta) * r, y = cos(theta) * r))
+}
+
+# Range donut: solid arc = confirmed low estimate, hatched arc = uncertain range.
+# Used for nontraditional hours where CCAV/DSS disagreement produces a range.
+range_donut <- function(n_low, n_high, n_total, clr_solid, clr_rest, title,
+                        label_combined, label_rest, caption = NULL) {
+  n_range  <- n_high - n_low
+  pct_low  <- round(100 * n_low  / n_total)
+  pct_high <- round(100 * n_high / n_total)
+  pct_rest <- round(100 * (n_total - n_high) / n_total)
+
+  segs <- tibble(n = c(n_low, n_range, n_total - n_high)) |>
+    mutate(
+      prop        = n / n_total,
+      end_angle   = 2 * pi * cumsum(prop),
+      start_angle = lag(end_angle, default = 0)
+    )
+
+  df_combined <- tibble(start_angle = segs$start_angle[1], end_angle = segs$end_angle[2])
+  df_rest     <- segs[3, ]
+  hatch_poly  <- arc_polygon(segs$start_angle[2], segs$end_angle[2])
+
+  combined_mid <- (segs$start_angle[1] + segs$end_angle[2]) / 2
+  rest_mid     <- (segs$start_angle[3] + segs$end_angle[3]) / 2
+
+  labels <- data.frame(
+    mid = c(combined_mid, rest_mid),
+    txt = c(paste0(label_combined, "\n", pct_low, "–", pct_high, "%"),
+            paste0(label_rest, "\n", pct_rest, "%"))
+  ) |> mutate(
+    lx    = sin(mid) * 1.45,
+    ly    = cos(mid) * 1.45,
+    sx0   = sin(mid) * 1.03,
+    sy0   = cos(mid) * 1.03,
+    sx1   = sin(mid) * 1.30,
+    sy1   = cos(mid) * 1.30,
+    hjust = ifelse(sin(mid) >= 0, 0, 1)
+  )
+
+  ggplot() +
+    geom_arc_bar(
+      data = bind_rows(df_combined, df_rest) |> mutate(grp = c("a", "b")),
+      aes(x0 = 0, y0 = 0, r0 = 0, r = 1,
+          start = start_angle, end = end_angle, fill = grp),
+      color = "white", linewidth = 0.8
+    ) +
+    geom_polygon_pattern(
+      data            = hatch_poly,
+      aes(x = x, y = y),
+      fill            = NA,
+      pattern         = "stripe",
+      pattern_colour  = "white",
+      pattern_fill    = "white",
+      pattern_angle   = 35,
+      pattern_density = 0.1,
+      pattern_spacing = 0.007,
+      color           = NA
+    ) +
+    geom_segment(
+      data = labels,
+      aes(x = sx0, y = sy0, xend = sx1, yend = sy1),
+      color = "grey55", linewidth = 0.4
+    ) +
+    geom_text(
+      data = labels,
+      aes(x = lx, y = ly, label = txt, hjust = hjust),
+      size = 5.6, lineheight = 1.0, color = "grey20"
+    ) +
+    scale_fill_manual(values = c("a" = clr_solid, "b" = clr_rest), guide = "none") +
+    coord_equal(clip = "off") +
+    xlim(-1.7, 1.7) + ylim(-1.5, 1.5) +
+    labs(title = title, caption = caption) +
+    theme_void() +
+    theme(
+      plot.title            = element_text(hjust = 0.5, size = 15, face = "bold",
+                                           margin = margin(b = 12)),
+      plot.caption          = element_text(hjust = 1, size = 9, color = "grey50",
+                                           margin = margin(t = 10)),
+      plot.caption.position = "plot",
+      plot.margin           = margin(20, 40, 30, 40)
+    )
+}
+```
+
+## Charts
+
+```{r subsidy-donut, fig.width=8, fig.height=6}
+p1 <- donut_chart(
+  sub_data, "status", "n",
+  colors = c("Accepts subsidy"         = clr_yes,
+             "Does not accept subsidy" = clr_no,
+             "Unknown"                 = clr_unk),
+  title  = paste0("Under-5 Facilities that Accept Subsidy\n(n = ", n_total, ")")
+)
+p1
+ggsave(file.path(plots_dir, "subsidy_donut.png"),
+       p1, width = 8, height = 6, dpi = 150, bg = "white")
+```
+
+```{r infants-donut, fig.width=8, fig.height=6}
+p2 <- donut_chart(
+  inf_data, "status", "n",
+  colors = c("Serves infants"          = clr_yes,
+             "Does not serve\ninfants" = clr_no),
+  title  = paste0("Under-5 Facilities that Serve Infants\n(n = ", n_total, ")")
+)
+p2
+ggsave(file.path(plots_dir, "infants_donut.png"),
+       p2, width = 8, height = 6, dpi = 150, bg = "white")
+```
+
+```{r infants-subsidy-donut, fig.width=8, fig.height=6}
+p3 <- donut_chart(
+  inf_sub_split, "status", "n",
+  colors = c("Serves infants\n& accepts subsidy"        = clr_yes,
+             "Serves infants,\ndoes not accept subsidy" = clr_unk,
+             "Does not serve\ninfants"                  = clr_no),
+  title  = paste0("Under-5 Facilities that Serve Infants by Subsidy Status\n(n = ", n_total, ")")
+)
+p3
+ggsave(file.path(plots_dir, "infants_subsidy_donut.png"),
+       p3, width = 8, height = 6, dpi = 150, bg = "white")
+```
+
+```{r nontrad-donut, fig.width=8, fig.height=6}
+p4 <- range_donut(
+  n_low          = nt_low,
+  n_high         = nt_high,
+  n_total        = n_total,
+  clr_solid      = clr_yes,
+  clr_rest       = clr_no,
+  title          = paste0("Under-5 Facilities Open Non-traditional Hours\n(8 pm–5 am,  n = ", n_total, ")"),
+  label_combined = "Non-traditional hours",
+  label_rest     = "Traditional hours",
+  caption        = "Range reflects source discrepancies"
+)
+p4
+ggsave(file.path(plots_dir, "nontrad_donut.png"),
+       p4, width = 8, height = 6, dpi = 150, bg = "white")
+```
+
+```{r nontrad-subsidy-donut, fig.width=8, fig.height=6}
+p5 <- range_donut(
+  n_low          = nt_sub_low,
+  n_high         = nt_sub_high,
+  n_total        = n_total,
+  clr_solid      = clr_yes,
+  clr_rest       = clr_no,
+  title          = paste0("Under-5 Facilities Open Non-traditional Hours by Subsidy Status\n(8 pm–5 am,  n = ", n_total, ")"),
+  label_combined = "Non-traditional hours\n& accepts subsidy",
+  label_rest     = "Traditional hours",
+  caption        = "Range reflects source discrepancies"
+)
+p5
+ggsave(file.path(plots_dir, "nontrad_subsidy_donut.png"),
+       p5, width = 8, height = 6, dpi = 150, bg = "white")
+```
+
+## Data Quality Audit
+
+### Input Verification
+
+```{r audit-input}
+cat(sprintf("Analysis file: %s\n", basename(analysis_file)))
+cat(sprintf("Rows loaded:   %d\n", nrow(u5)))
+cat(sprintf("Expected columns present: %s\n",
+  all(c("nontrad_low", "nontrad_high", "serves_infants", "accepts_subsidy") %in% names(u5))))
+```
+
+### Count Cross-Check
+
+```{r audit-counts}
+knitr::kable(data.frame(
+  Chart = c("Subsidy", "Infants", "Infants × subsidy", "Nontrad (low)", "Nontrad (high)"),
+  n_plotted = c(
+    sum(sub_data$n),
+    sum(inf_data$n),
+    sum(inf_sub_split$n),
+    nt_low + (n_total - nt_high) + (nt_high - nt_low),
+    n_total
+  ),
+  n_expected = n_total
+), caption = "All chart denominators should equal n_total")
+```
+
+### Plot Files Written
+
+```{r audit-plots}
+plot_files <- c(
+  "subsidy_donut.png", "infants_donut.png", "infants_subsidy_donut.png",
+  "nontrad_donut.png", "nontrad_subsidy_donut.png"
+)
+knitr::kable(data.frame(
+  File   = plot_files,
+  Exists = file.exists(file.path(plots_dir, plot_files)),
+  Size_kb = round(file.size(file.path(plots_dir, plot_files)) / 1024, 1)
+), caption = "Generated plot files")
+```

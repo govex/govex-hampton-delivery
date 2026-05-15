@@ -1,0 +1,296 @@
+---
+title: "Hampton Childcare — DSS Standardize"
+date: "`r Sys.Date()`"
+format: gfm
+---
+
+## Overview
+
+Cleans and normalizes the DSS ingest data to produce merge-ready fields,
+applying the same age range and hours parsing as the CCAV standardize module.
+DSS hours strings use a different format (`"6:00 am - 5:00 pm, Monday -
+Friday"`) and require separate parsing logic.
+
+**Input:** `Data/ingest/DSS_ingest_YYYY-MM-DD.csv`
+**Output:** `Data/standardize/DSS_standardize_YYYY-MM-DD.csv`
+
+| Step | Input format | Output |
+|---|---|---|
+| Age range parsing | `"1 month - 12 years 11 months"` | `age_min_months`, `age_max_months` |
+| Hours parsing | `"6:00 am - 5:00 pm, Monday - Friday"` | `days`, `open_time`, `close_time` (24h HH:MM) |
+| Name key | Honorifics stripped, lowercased, punctuation removed | `name_key` |
+| Address key | Uppercased, whitespace normalized | `address_key` |
+
+| Limitation | Detail |
+|---|---|
+| Age data absent for some facilities | Parsed values will be NA; those facilities are excluded in the analysis stage. |
+| Hours format variation | DSS hours strings vary including `a.m.`/`p.m.` variants; unrecognized formats produce NA. |
+| Parse errors from ingest | Facilities flagged `parse_error = TRUE` in ingest will have mostly NA fields. |
+
+---
+
+```{r setup, include=FALSE}
+library(here)
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(knitr)
+
+source(here::here("config.R"))
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+today <- format(Sys.Date(), "%Y-%m-%d")
+```
+
+## Helper Functions
+
+```{r helpers, include=FALSE}
+parse_age_to_months <- function(x) {
+  x <- str_to_lower(str_squish(x))
+  years  <- coalesce(as.numeric(str_extract(x, "(\\d+)(?=\\s*year)")),  0)
+  months <- coalesce(as.numeric(str_extract(x, "(\\d+)(?=\\s*month)")), 0)
+  years * 12 + months
+}
+
+parse_age_range <- function(age_str) {
+  if (is.na(age_str) || age_str == "") {
+    return(list(age_min_months = NA_real_, age_max_months = NA_real_))
+  }
+  parts <- str_split(age_str, "\\s*-\\s*", n = 2)[[1]]
+  if (length(parts) < 2) {
+    return(list(age_min_months = NA_real_, age_max_months = NA_real_))
+  }
+  list(
+    age_min_months = parse_age_to_months(parts[1]),
+    age_max_months = parse_age_to_months(parts[2])
+  )
+}
+
+# Normalize a.m./p.m. variants to am/pm before time extraction
+normalise_ampm <- function(x) {
+  x |>
+    str_to_lower() |>
+    str_replace_all("a\\.m\\.", "am") |>
+    str_replace_all("p\\.m\\.", "pm") |>
+    str_squish()
+}
+
+to_24h <- function(t, ap) {
+  if (is.na(t) || t == "") return(NA_character_)
+  parts <- str_split(t, ":")[[1]]
+  h <- as.integer(parts[1])
+  m <- as.integer(parts[2])
+  if (!is.na(ap) && ap != "") {
+    if (ap == "pm" && h != 12) h <- h + 12
+    if (ap == "am" && h == 12) h <- 0L
+  }
+  sprintf("%02d:%02d", h, m)
+}
+
+# Parse DSS hours string format: "6:00 am - 5:00 pm, Monday - Friday"
+# Falls back to day-name detection when no comma separator is present
+parse_dss_hours <- function(h) {
+  if (is.na(h) || h == "") {
+    return(list(days = NA_character_, open_time = NA_character_, close_time = NA_character_))
+  }
+
+  h_norm    <- normalise_ampm(h)
+  comma_pos <- str_locate(h_norm, ",")[1, "start"]
+
+  if (!is.na(comma_pos)) {
+    time_part <- str_sub(h_norm, 1, comma_pos - 1) |> str_squish()
+    day_part  <- str_sub(h_norm, comma_pos + 1)    |> str_squish()
+  } else {
+    day_match <- str_locate(
+      h_norm, "(monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    )[1, "start"]
+    if (!is.na(day_match)) {
+      time_part <- str_sub(h_norm, 1, day_match - 1) |> str_squish()
+      day_part  <- str_sub(h_norm, day_match)         |> str_squish()
+    } else {
+      time_part <- h_norm
+      day_part  <- NA_character_
+    }
+  }
+
+  day_range <- day_part |>
+    str_replace_all("\\s*-\\s*", "-") |>
+    str_to_title() |>
+    str_squish()
+
+  times <- str_extract_all(time_part, "\\d{1,2}:\\d{2}")[[1]]
+  ampm  <- str_extract_all(time_part, "(am|pm)")[[1]]
+
+  open_time  <- if (length(times) >= 1) to_24h(times[1], ampm[1]) else NA_character_
+  close_time <- if (length(times) >= 2) to_24h(times[2], ampm[2]) else NA_character_
+
+  list(days = day_range, open_time = open_time, close_time = close_time)
+}
+
+standardise_name <- function(x) {
+  x |>
+    str_remove_all("^(Ms\\.|Mrs\\.|Mr\\.|Dr\\.)\\s*") |>
+    str_to_lower() |>
+    str_replace_all("[^a-z0-9 ]", "") |>
+    str_squish()
+}
+
+# DSS addresses are already well-formed; uppercase and normalize spacing
+standardise_address <- function(x) {
+  x |>
+    str_squish() |>
+    str_to_upper() |>
+    str_replace_all("\\s*,\\s*", ", ") |>
+    str_squish()
+}
+```
+
+## Load Data
+
+```{r load-data}
+ingest_files <- list.files(
+  here("Data", "01_ingest"),
+  pattern    = "^DSS_ingest_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$",
+  full.names = TRUE
+)
+if (length(ingest_files) == 0) stop("No DSS ingest file found in Data/ingest/")
+ingest_path <- ingest_files[which.max(file.mtime(ingest_files))]
+cat(sprintf("Reading: %s\n", basename(ingest_path)))
+raw <- read_csv(ingest_path, show_col_types = FALSE)
+```
+
+## Apply Transformations
+
+```{r transform}
+processed <- raw |>
+  mutate(
+    age_parsed     = map(ages_raw, parse_age_range),
+    age_min_months = map_dbl(age_parsed, "age_min_months"),
+    age_max_months = map_dbl(age_parsed, "age_max_months"),
+    serves_under_5 = age_min_months < 60,
+    hours_parsed   = map(hours, parse_dss_hours),
+    days           = map_chr(hours_parsed, "days"),
+    open_time      = map_chr(hours_parsed, "open_time"),
+    close_time     = map_chr(hours_parsed, "close_time"),
+    name_key       = standardise_name(name),
+    address_key    = standardise_address(address),
+    source         = "DSS"
+  ) |>
+  select(-age_parsed, -hours_parsed)
+```
+
+## Write Output
+
+```{r write-output}
+output_path <- here("Data", "02_standardize", paste0("DSS_standardize_", today, ".csv"))
+dir.create(here("Data", "02_standardize"), showWarnings = FALSE, recursive = TRUE)
+write_csv(processed, output_path)
+prune_dated(here("Data", "02_standardize"), "^DSS_standardize_[0-9]{4}-[0-9]{2}-[0-9]{2}\\.csv$")
+cat(sprintf("Wrote %d rows → %s\n", nrow(processed), basename(output_path)))
+```
+
+## Main Findings
+
+```{r main-findings}
+kable(data.frame(
+  Metric = c(
+    "Input rows", "Output rows",
+    "Licensed", "Unlicensed",
+    "Serves under-5 (age_min < 60 months)",
+    "Subsidy providers",
+    "Parse errors from ingest",
+    "Missing age data",
+    "Missing open_time"
+  ),
+  Count = c(
+    nrow(raw), nrow(processed),
+    sum(raw$tab == "Licensed",   na.rm = TRUE),
+    sum(raw$tab == "Unlicensed", na.rm = TRUE),
+    sum(processed$serves_under_5,                    na.rm = TRUE),
+    sum(str_to_lower(processed$subsidy_provider) == "yes", na.rm = TRUE),
+    sum(processed$parse_error, na.rm = TRUE),
+    sum(is.na(processed$age_min_months)),
+    sum(is.na(processed$open_time))
+  )
+))
+```
+
+## Summary
+
+```{r summary-subsidy}
+kable(
+  processed |> count(subsidy_provider, sort = TRUE),
+  caption = "Subsidy provider values (raw DSS field)"
+)
+```
+
+```{r summary-days}
+kable(
+  processed |> count(days, sort = TRUE),
+  caption = "Days distribution"
+)
+```
+
+## Data Quality Audit
+
+### Age Range Distribution
+
+```{r audit-age}
+cat("age_min_months:\n")
+print(summary(processed$age_min_months))
+cat("\nage_max_months:\n")
+print(summary(processed$age_max_months))
+```
+
+### Hours Parsing Failures
+
+```{r audit-hours}
+unparsed <- processed |>
+  filter(!is.na(hours), hours != "", is.na(open_time))
+
+if (nrow(unparsed) > 0) {
+  cat(sprintf("WARNING: %d facilities have hours text but no parsed open_time:\n", nrow(unparsed)))
+  kable(unparsed |> select(name, hours, days, open_time, close_time))
+} else {
+  cat("All facilities with hours text were successfully parsed.\n")
+}
+```
+
+### Missing Fields
+
+```{r audit-missing}
+kable(data.frame(
+  Field    = c("address_key", "age_min_months", "open_time", "close_time", "name_key"),
+  NA_count = c(
+    sum(is.na(processed$address_key)),
+    sum(is.na(processed$age_min_months)),
+    sum(is.na(processed$open_time)),
+    sum(is.na(processed$close_time)),
+    sum(is.na(processed$name_key))
+  )
+))
+```
+
+### Parse Error Rows
+
+```{r audit-parse-errors}
+errors <- processed |> filter(parse_error == TRUE)
+if (nrow(errors) > 0) {
+  cat(sprintf("%d facilities had ingest parse errors (mostly NA fields):\n", nrow(errors)))
+  kable(errors |> select(name, tab, address, hours, ages_raw))
+} else {
+  cat("No parse errors from ingest.\n")
+}
+```
+
+### Random Spot Check
+
+```{r audit-spot-check}
+set.seed(as.integer(Sys.Date()))
+kable(
+  slice_sample(processed, n = min(5, nrow(processed))) |>
+    select(name, age_min_months, age_max_months, days, open_time, close_time, subsidy_provider),
+  caption = "Random date-seeded spot check"
+)
+```
